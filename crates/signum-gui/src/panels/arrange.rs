@@ -19,6 +19,7 @@ pub enum ArrangeAction {
     AddAudioTrack,
     AddMidiTrack,
     TogglePlayback,
+    SetLoopRegion { start_sample: u64, end_sample: u64 },
 }
 
 /// Arrange panel state
@@ -28,6 +29,10 @@ pub struct ArrangePanel {
     pub track_height: f32,
     pub vertical_scroll: f32,
     pub snap_to_grid: bool,
+    /// Loop selection drag state (start_beat when dragging)
+    loop_drag_start: Option<f32>,
+    /// Current loop selection being drawn (start_beat, end_beat)
+    loop_selection: Option<(f32, f32)>,
 }
 
 impl ArrangePanel {
@@ -37,7 +42,9 @@ impl ArrangePanel {
             scroll_offset_beats: 0.0,
             track_height: 80.0,
             vertical_scroll: 0.0,
-            snap_to_grid: true, // Default on
+            snap_to_grid: true,
+            loop_drag_start: None,
+            loop_selection: None,
         }
     }
 
@@ -325,8 +332,24 @@ impl ArrangePanel {
             ));
         }
 
-        // Handle click to seek
-        if response.clicked() {
+        // Handle drag for loop selection (Ctrl+drag)
+        let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        self.handle_loop_drag(&response, rect, start_beat, grid_step, samples_per_beat, &mut action, ctrl_held);
+
+        // Draw loop selection being created
+        if let Some((sel_start, sel_end)) = self.loop_selection {
+            let sel_x_start = rect.left() + ((sel_start - start_beat) * self.pixels_per_beat);
+            let sel_x_end = rect.left() + ((sel_end - start_beat) * self.pixels_per_beat);
+            let sel_rect = Rect::from_min_max(
+                egui::pos2(sel_x_start, ruler_rect.top()),
+                egui::pos2(sel_x_end, rect.bottom()),
+            );
+            painter.rect_filled(sel_rect, 0.0, Color32::from_rgba_unmultiplied(100, 180, 255, 40));
+            painter.rect_stroke(sel_rect, 0.0, Stroke::new(1.0, Color32::from_rgb(100, 180, 255)), egui::StrokeKind::Inside);
+        }
+
+        // Handle click to seek (only if not dragging loop)
+        if response.clicked() && self.loop_drag_start.is_none() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let mut click_beat = start_beat + (pos.x - rect.left()) / self.pixels_per_beat;
 
@@ -685,6 +708,56 @@ impl ArrangePanel {
     /// Get vertical scroll offset for syncing with track headers
     pub fn vertical_scroll(&self) -> f32 {
         self.vertical_scroll
+    }
+
+    /// Handle drag for loop selection (flat, no nested conditionals)
+    fn handle_loop_drag(
+        &mut self,
+        response: &egui::Response,
+        rect: Rect,
+        start_beat: f32,
+        grid_step: f32,
+        samples_per_beat: f64,
+        action: &mut ArrangeAction,
+        ctrl_held: bool,
+    ) {
+        // Start drag - only with Ctrl held
+        if response.drag_started() && ctrl_held {
+            let Some(pos) = response.interact_pointer_pos() else { return };
+            if !rect.contains(pos) { return };
+
+            let beat = start_beat + (pos.x - rect.left()) / self.pixels_per_beat;
+            let snapped = (beat / grid_step).floor() * grid_step;
+            self.loop_drag_start = Some(snapped);
+            self.loop_selection = Some((snapped, snapped + grid_step));
+        }
+
+        // Continue drag
+        if response.dragged() {
+            let Some(drag_start) = self.loop_drag_start else { return };
+            let Some(pos) = response.interact_pointer_pos() else { return };
+
+            let beat = start_beat + (pos.x - rect.left()) / self.pixels_per_beat;
+            let snapped = (beat / grid_step).floor() * grid_step;
+
+            let (sel_start, sel_end) = if snapped < drag_start {
+                (snapped, drag_start)
+            } else {
+                (drag_start, snapped.max(drag_start + grid_step))
+            };
+            self.loop_selection = Some((sel_start, sel_end));
+        }
+
+        // End drag - set loop region
+        if response.drag_stopped() && self.loop_drag_start.is_some() {
+            if let Some((sel_start, sel_end)) = self.loop_selection {
+                let start_sample = (sel_start as f64 * samples_per_beat) as u64;
+                let end_sample = (sel_end as f64 * samples_per_beat) as u64;
+                *action = ArrangeAction::SetLoopRegion { start_sample, end_sample };
+            }
+            self.loop_drag_start = None;
+            self.loop_selection = None;
+        }
     }
 }
 

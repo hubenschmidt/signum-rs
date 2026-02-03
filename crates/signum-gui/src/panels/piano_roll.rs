@@ -29,6 +29,10 @@ pub enum PianoRollAction {
     StopNote {
         pitch: u8,
     },
+    /// Stop multiple notes (used when deleting notes during playback)
+    StopNotes {
+        pitches: Vec<u8>,
+    },
     /// Record a note during playback
     RecordNote {
         pitch: u8,
@@ -39,8 +43,8 @@ pub enum PianoRollAction {
 /// State for dragging a note
 #[derive(Clone, Copy)]
 enum DragMode {
-    Move,       // Moving the entire note
-    ResizeEnd,  // Resizing from the right edge
+    Move,
+    ResizeEnd,
 }
 
 /// State for drawing a new note
@@ -50,6 +54,7 @@ struct DrawState {
 }
 
 /// Note drag state
+#[derive(Clone)]
 struct NoteDragState {
     note_idx: usize,
     mode: DragMode,
@@ -103,12 +108,16 @@ pub struct PianoRollPanel {
     grid_subdivision: f64,
     /// Loop selection (beat range)
     loop_selection: Option<LoopSelection>,
-    /// Loop drag state
+    /// Loop drag state (for moving/resizing existing loop)
     loop_drag: Option<(LoopDragMode, f64)>, // (mode, original_beat)
+    /// Loop selection drag state (for creating new loop via drag)
+    loop_select_drag: Option<f64>, // start beat of drag
     /// Currently pressed keyboard keys (for note preview)
     pressed_keys: HashSet<egui::Key>,
     /// Keyboard octave offset (0 = C3/C4 base, +1 = C4/C5, -1 = C2/C3)
     keyboard_octave: i8,
+    /// Currently active MIDI pitches (for visual feedback on piano keys)
+    active_pitches: HashSet<u8>,
 }
 
 impl Default for PianoRollPanel {
@@ -134,8 +143,10 @@ impl PianoRollPanel {
             grid_subdivision: 0.25, // 16th notes default
             loop_selection: None,
             loop_drag: None,
+            loop_select_drag: None,
             pressed_keys: HashSet::new(),
             keyboard_octave: 0,
+            active_pitches: HashSet::new(),
         }
     }
 
@@ -267,6 +278,7 @@ impl PianoRollPanel {
             // Octave shift for keyboard input
             if ui.button("Oct-").clicked() {
                 self.keyboard_octave = (self.keyboard_octave - 1).max(-2);
+                self.active_pitches.clear();
             }
             let octave_name = match self.keyboard_octave {
                 -2 => "C1-C3",
@@ -279,6 +291,7 @@ impl PianoRollPanel {
             ui.label(format!("Oct: {}", octave_name));
             if ui.button("Oct+").clicked() {
                 self.keyboard_octave = (self.keyboard_octave + 1).min(2);
+                self.active_pitches.clear();
             }
 
             ui.separator();
@@ -286,11 +299,18 @@ impl PianoRollPanel {
             if ui.button("Delete Selected").clicked() && !self.selected_notes.is_empty() {
                 let mut indices: Vec<_> = self.selected_notes.iter().copied().collect();
                 indices.sort_by(|a, b| b.cmp(a)); // Sort descending to remove from end first
+                // Capture pitches before deletion to send Note Offs
+                let pitches: Vec<u8> = indices.iter()
+                    .filter_map(|&idx| clip.notes.get(idx).map(|n| n.pitch))
+                    .collect();
                 for idx in indices {
                     clip.remove_note(idx);
                 }
                 self.selected_notes.clear();
                 modified = true;
+                if !pitches.is_empty() {
+                    action = PianoRollAction::StopNotes { pitches };
+                }
             }
 
             // Loop selection info
@@ -381,71 +401,29 @@ impl PianoRollPanel {
             }
         }
 
-        // Handle note dragging
+        // Handle drag start
         if response.drag_started() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                if grid_rect.contains(pos) {
-                    let (beat, pitch) = self.pos_to_beat_pitch(pos, grid_rect);
-
-                    // Check if starting drag on a note
-                    if let Some((note_idx, drag_mode)) = self.find_note_drag_target(clip, beat, pitch, grid_rect) {
-                        let note = &clip.notes[note_idx];
-                        self.note_drag = Some(NoteDragState {
-                            note_idx,
-                            mode: drag_mode,
-                            original_start_tick: note.start_tick,
-                            original_duration_ticks: note.duration_ticks,
-                            original_pitch: note.pitch,
-                            drag_start_beat: beat,
-                            drag_start_pitch: pitch,
-                        });
-                        self.selected_notes.clear();
-                        self.selected_notes.insert(note_idx);
-                    }
-                }
-            }
+            let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            self.handle_drag_start(&response, grid_rect, clip, ctrl_held);
         }
 
+        // Handle drag continue
         if response.dragged() {
-            if let Some(ref drag_state) = self.note_drag {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let (beat, pitch) = self.pos_to_beat_pitch(pos, grid_rect);
-                    let beat_delta = beat - drag_state.drag_start_beat;
-                    let pitch_delta = pitch as i32 - drag_state.drag_start_pitch as i32;
-
-                    if let Some(note) = clip.notes.get_mut(drag_state.note_idx) {
-                        match drag_state.mode {
-                            DragMode::Move => {
-                                // Move note position and pitch
-                                let new_start_beat = (drag_state.original_start_tick as f64 / clip.ppq as f64) + beat_delta;
-                                let snapped_beat = if self.snap_to_grid {
-                                    (new_start_beat / self.grid_subdivision).round() * self.grid_subdivision
-                                } else {
-                                    new_start_beat
-                                };
-                                note.start_tick = ((snapped_beat.max(0.0)) * clip.ppq as f64) as u64;
-                                note.pitch = (drag_state.original_pitch as i32 + pitch_delta).clamp(0, 127) as u8;
-                            }
-                            DragMode::ResizeEnd => {
-                                // Resize note duration
-                                let new_duration_beats = (drag_state.original_duration_ticks as f64 / clip.ppq as f64) + beat_delta;
-                                let snapped_duration = if self.snap_to_grid {
-                                    (new_duration_beats / self.grid_subdivision).round() * self.grid_subdivision
-                                } else {
-                                    new_duration_beats
-                                };
-                                let min_duration = self.grid_subdivision;
-                                note.duration_ticks = ((snapped_duration.max(min_duration)) * clip.ppq as f64) as u64;
-                            }
-                        }
-                        modified = true;
-                    }
-                }
-            }
+            modified |= self.handle_drag_continue(&response, grid_rect, clip);
         }
 
+        // Handle drag end - emit loop region if loop selection was made
         if response.drag_stopped() {
+            if self.loop_select_drag.is_some() {
+                if let Some(ref sel) = self.loop_selection {
+                    let samples_per_beat = sample_rate as f64 * 60.0 / bpm;
+                    let start_sample = clip_start_sample + (sel.start_beat * samples_per_beat) as u64;
+                    let end_sample = clip_start_sample + (sel.end_beat * samples_per_beat) as u64;
+                    action = PianoRollAction::SetLoopRegion { start_sample, end_sample };
+                }
+            }
             self.note_drag = None;
+            self.loop_select_drag = None;
         }
 
         // Handle click (only if not dragging)
@@ -458,16 +436,13 @@ impl PianoRollPanel {
                     let clicked_note = self.find_note_at(clip, beat, pitch, bpm, sample_rate);
 
                     if let Some(note_idx) = clicked_note {
-                        // Select/deselect note
-                        if ui.input(|i| i.modifiers.shift) {
-                            if self.selected_notes.contains(&note_idx) {
-                                self.selected_notes.remove(&note_idx);
-                            } else {
-                                self.selected_notes.insert(note_idx);
-                            }
-                        } else {
-                            self.selected_notes.clear();
-                            self.selected_notes.insert(note_idx);
+                        // Capture pitch before deletion to send Note Off
+                        let pitch = clip.notes.get(note_idx).map(|n| n.pitch);
+                        clip.remove_note(note_idx);
+                        self.selected_notes.remove(&note_idx);
+                        modified = true;
+                        if let Some(p) = pitch {
+                            action = PianoRollAction::StopNotes { pitches: vec![p] };
                         }
                     } else {
                         // Create new note snapped to grid
@@ -503,11 +478,18 @@ impl PianoRollPanel {
             if !self.selected_notes.is_empty() {
                 let mut indices: Vec<_> = self.selected_notes.iter().copied().collect();
                 indices.sort_by(|a, b| b.cmp(a));
+                // Capture pitches before deletion to send Note Offs
+                let pitches: Vec<u8> = indices.iter()
+                    .filter_map(|&idx| clip.notes.get(idx).map(|n| n.pitch))
+                    .collect();
                 for idx in indices {
                     clip.remove_note(idx);
                 }
                 self.selected_notes.clear();
                 modified = true;
+                if !pitches.is_empty() {
+                    action = PianoRollAction::StopNotes { pitches };
+                }
             }
         }
 
@@ -517,12 +499,14 @@ impl PianoRollPanel {
             let mut note_on: Option<u8> = None;
             let mut note_off: Option<u8> = None;
 
-            // Check octave shift keys
+            // Check octave shift keys (clear active pitches when octave changes)
             if ui.input(|i| i.key_pressed(egui::Key::Minus)) {
                 self.keyboard_octave = (self.keyboard_octave - 1).max(-2);
+                self.active_pitches.clear();
             }
             if ui.input(|i| i.key_pressed(egui::Key::Equals)) {
                 self.keyboard_octave = (self.keyboard_octave + 1).min(2);
+                self.active_pitches.clear();
             }
 
             // Check piano keys - use key_pressed for more reliable detection
@@ -534,12 +518,14 @@ impl PianoRollPanel {
                     // Key just pressed
                     self.pressed_keys.insert(key);
                     if let Some(pitch) = self.key_to_pitch(key) {
+                        self.active_pitches.insert(pitch);
                         note_on = Some(pitch);
                     }
                 } else if !is_pressed && was_pressed {
                     // Key just released
                     self.pressed_keys.remove(&key);
                     if let Some(pitch) = self.key_to_pitch(key) {
+                        self.active_pitches.remove(&pitch);
                         note_off = Some(pitch);
                     }
                 }
@@ -763,7 +749,12 @@ impl PianoRollPanel {
             );
 
             let is_black = matches!(pitch % 12, 1 | 3 | 6 | 8 | 10);
-            let color = if is_black {
+            let is_active = self.active_pitches.contains(&pitch);
+
+            // Highlight active (playing) keys with orange
+            let color = if is_active {
+                Color32::from_rgb(255, 140, 0) // Orange for active
+            } else if is_black {
                 Color32::from_gray(30)
             } else {
                 Color32::from_gray(60)
@@ -774,13 +765,14 @@ impl PianoRollPanel {
 
             // Label C notes
             if pitch % 12 == 0 {
-                let octave = pitch / 12 - 1;
+                let octave = (pitch as i32 / 12) - 1;
+                let text_color = if is_active { Color32::BLACK } else { Color32::WHITE };
                 painter.text(
                     Pos2::new(rect.left() + 2.0, y + 2.0),
                     egui::Align2::LEFT_TOP,
                     format!("C{}", octave),
                     egui::FontId::proportional(9.0),
-                    Color32::WHITE,
+                    text_color,
                 );
             }
         }
@@ -886,8 +878,8 @@ impl PianoRollPanel {
 
     fn pos_to_beat_pitch(&self, pos: Pos2, rect: Rect) -> (f64, u8) {
         let beat = self.scroll_x + (pos.x - rect.left()) as f64 / self.pixels_per_beat as f64;
-        let relative_y = (pos.y - rect.top()) / self.key_height;
-        let inverted_pitch = (self.visible_pitches as f32 - 1.0 - relative_y) as u8;
+        let row = ((pos.y - rect.top()) / self.key_height).floor();
+        let inverted_pitch = ((self.visible_pitches - 1) as f32 - row).max(0.0) as u8;
         let pitch = self.visible_pitch_min.saturating_add(inverted_pitch).min(127);
         (beat, pitch)
     }
@@ -916,5 +908,95 @@ impl PianoRollPanel {
     fn samples_to_beats(&self, samples: u64, _ppq: u16, bpm: f64, sample_rate: u32) -> f64 {
         let seconds = samples as f64 / sample_rate as f64;
         seconds * bpm / 60.0
+    }
+
+    /// Handle drag start - either note drag or loop selection (flat, guard clauses)
+    fn handle_drag_start(&mut self, response: &egui::Response, grid_rect: Rect, clip: &MidiClip, ctrl_held: bool) {
+        let Some(pos) = response.interact_pointer_pos() else { return };
+        if !grid_rect.contains(pos) { return };
+
+        let (beat, pitch) = self.pos_to_beat_pitch(pos, grid_rect);
+
+        // Ctrl+drag starts loop selection
+        if ctrl_held {
+            let snapped_beat = (beat / 0.25).floor() * 0.25;
+            self.loop_select_drag = Some(snapped_beat);
+            self.loop_selection = Some(LoopSelection {
+                start_beat: snapped_beat,
+                end_beat: snapped_beat + 0.25,
+            });
+            return;
+        }
+
+        // Check if starting drag on a note
+        let note_target = self.find_note_drag_target(clip, beat, pitch, grid_rect);
+        let Some((note_idx, drag_mode)) = note_target else { return };
+
+        let note = &clip.notes[note_idx];
+        self.note_drag = Some(NoteDragState {
+            note_idx,
+            mode: drag_mode,
+            original_start_tick: note.start_tick,
+            original_duration_ticks: note.duration_ticks,
+            original_pitch: note.pitch,
+            drag_start_beat: beat,
+            drag_start_pitch: pitch,
+        });
+        self.selected_notes.clear();
+        self.selected_notes.insert(note_idx);
+    }
+
+    /// Handle drag continue - update note position or loop selection (flat, guard clauses)
+    fn handle_drag_continue(&mut self, response: &egui::Response, grid_rect: Rect, clip: &mut MidiClip) -> bool {
+        let Some(pos) = response.interact_pointer_pos() else { return false };
+
+        // Handle note drag
+        if let Some(ref drag_state) = self.note_drag.clone() {
+            return self.update_note_drag(pos, grid_rect, clip, &drag_state);
+        }
+
+        // Handle loop selection drag
+        let Some(start_beat) = self.loop_select_drag else { return false };
+        let (beat, _) = self.pos_to_beat_pitch(pos, grid_rect);
+        let snapped_beat = (beat / 0.25).floor() * 0.25;
+
+        let (sel_start, sel_end) = if snapped_beat < start_beat {
+            (snapped_beat, start_beat)
+        } else {
+            (start_beat, snapped_beat.max(start_beat + 0.25))
+        };
+
+        self.loop_selection = Some(LoopSelection {
+            start_beat: sel_start,
+            end_beat: sel_end,
+        });
+        false
+    }
+
+    /// Update note position/size during drag (flat logic)
+    fn update_note_drag(&mut self, pos: Pos2, grid_rect: Rect, clip: &mut MidiClip, drag_state: &NoteDragState) -> bool {
+        let (beat, pitch) = self.pos_to_beat_pitch(pos, grid_rect);
+        let beat_delta = beat - drag_state.drag_start_beat;
+        let pitch_delta = pitch as i32 - drag_state.drag_start_pitch as i32;
+
+        let Some(note) = clip.notes.get_mut(drag_state.note_idx) else { return false };
+
+        let snap_factor = if self.snap_to_grid { self.grid_subdivision } else { 0.001 };
+
+        match drag_state.mode {
+            DragMode::Move => {
+                let new_start_beat = (drag_state.original_start_tick as f64 / clip.ppq as f64) + beat_delta;
+                let snapped_beat = (new_start_beat / snap_factor).round() * snap_factor;
+                note.start_tick = (snapped_beat.max(0.0) * clip.ppq as f64) as u64;
+                note.pitch = (drag_state.original_pitch as i32 + pitch_delta).clamp(0, 127) as u8;
+            }
+            DragMode::ResizeEnd => {
+                let new_duration_beats = (drag_state.original_duration_ticks as f64 / clip.ppq as f64) + beat_delta;
+                let snapped_duration = (new_duration_beats / snap_factor).round() * snap_factor;
+                let min_duration = self.grid_subdivision;
+                note.duration_ticks = (snapped_duration.max(min_duration) * clip.ppq as f64) as u64;
+            }
+        }
+        true
     }
 }

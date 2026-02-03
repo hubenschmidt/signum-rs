@@ -203,12 +203,36 @@ impl AudioEngine {
             let sample_rate = timeline.transport.sample_rate;
 
             // Queue MIDI events for each instrument from clips
+            // Handle loop wrap: if buffer spans loop_end, collect from both regions
             for track in timeline.tracks.iter().filter(|t| t.kind == TrackKind::Midi && !t.mute) {
-                let Some(inst_id) = track.instrument_id else { continue };
-                let Some(instrument) = instruments.get_mut(&inst_id) else { continue };
+                let Some(inst_id) = track.instrument_id else {
+                    tracing::trace!("MIDI track '{}' has no instrument", track.name);
+                    continue;
+                };
+                let Some(instrument) = instruments.get_mut(&inst_id) else {
+                    tracing::warn!("Instrument {} not found for track '{}'", inst_id, track.name);
+                    continue;
+                };
+
+                let buffer_end = pos + num_frames as u64;
+                let spans_loop = loop_enabled && loop_end > loop_start && pos < loop_end && buffer_end > loop_end;
 
                 for clip in &track.midi_clips {
-                    Self::collect_midi_events(clip, pos, num_frames, bpm, sample_rate, instrument);
+                    tracing::trace!("MIDI collect: pos={} buffer_end={} loop={}..{} spans={}", pos, buffer_end, loop_start, loop_end, spans_loop);
+
+                    if spans_loop {
+                        // Part 1: from pos to loop_end
+                        let frames_before_loop = (loop_end - pos) as usize;
+                        Self::collect_midi_events(clip, pos, frames_before_loop, bpm, sample_rate, instrument);
+
+                        // Part 2: from loop_start for remaining frames
+                        let frames_after_loop = num_frames - frames_before_loop;
+                        Self::collect_midi_events_with_offset(
+                            clip, loop_start, frames_after_loop, bpm, sample_rate, instrument, frames_before_loop as u32
+                        );
+                    } else {
+                        Self::collect_midi_events(clip, pos, num_frames, bpm, sample_rate, instrument);
+                    }
                 }
             }
 
@@ -286,6 +310,19 @@ impl AudioEngine {
         sample_rate: u32,
         instrument: &mut Vst3Instrument,
     ) {
+        Self::collect_midi_events_with_offset(clip, buffer_start, buffer_frames, bpm, sample_rate, instrument, 0);
+    }
+
+    /// Collect MIDI events with an additional offset (for loop wrap handling)
+    fn collect_midi_events_with_offset(
+        clip: &MidiClip,
+        buffer_start: u64,
+        buffer_frames: usize,
+        bpm: f64,
+        sample_rate: u32,
+        instrument: &mut Vst3Instrument,
+        base_offset: u32,
+    ) {
         let buffer_end = buffer_start + buffer_frames as u64;
 
         // Clip bounds check
@@ -293,7 +330,6 @@ impl AudioEngine {
             return;
         }
 
-        // Ticks to samples conversion
         let samples_per_tick = (sample_rate as f64 * 60.0) / (bpm * clip.ppq as f64);
 
         for note in &clip.notes {
@@ -302,13 +338,16 @@ impl AudioEngine {
 
             // Note On in this buffer?
             if note_start_sample >= buffer_start && note_start_sample < buffer_end {
-                let offset = (note_start_sample - buffer_start) as u32;
+                let offset = base_offset + (note_start_sample - buffer_start) as u32;
+                // Use offset 1 minimum at loop start to avoid timing issues
+                let offset = offset.max(1);
+                tracing::debug!("Queueing note on: pitch={} offset={} buffer_start={}", note.pitch, offset, buffer_start);
                 instrument.queue_note_on(note.pitch, note.velocity, 0, offset);
             }
 
             // Note Off in this buffer?
             if note_end_sample >= buffer_start && note_end_sample < buffer_end {
-                let offset = (note_end_sample - buffer_start) as u32;
+                let offset = base_offset + (note_end_sample - buffer_start) as u32;
                 instrument.queue_note_off(note.pitch, 64, 0, offset);
             }
         }

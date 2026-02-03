@@ -79,9 +79,14 @@ impl SignumApp {
             tracing::error!("Failed to start audio engine: {}", e);
         }
 
-        // Create a default track
+        // Create a default MIDI track and set one-bar loop
         engine.with_timeline(|timeline| {
-            timeline.add_track(TrackKind::Audio, "Track 1");
+            timeline.add_track(TrackKind::Midi, "Track 1");
+            // Set default loop to one bar (4 beats at current tempo)
+            let samples_per_beat = (timeline.transport.sample_rate as f64 * 60.0) / timeline.transport.bpm;
+            timeline.transport.loop_start = 0;
+            timeline.transport.loop_end = (samples_per_beat * 4.0) as u64; // One bar
+            timeline.transport.loop_enabled = true;
         });
 
         let input_monitor = InputMonitor::new();
@@ -513,14 +518,16 @@ impl SignumApp {
             }
             ArrangeAction::TogglePlayback => {
                 if self.engine.is_playing() {
-                    // Stop and return to start position
                     self.engine.pause();
                     self.engine.seek(self.playback_start_position);
                 } else {
-                    // Save current position and start playing
                     self.playback_start_position = self.engine.position();
                     self.engine.play();
                 }
+            }
+            ArrangeAction::SetLoopRegion { start_sample, end_sample } => {
+                self.engine.set_loop_region(start_sample, end_sample);
+                self.engine.set_loop_enabled(true);
             }
             ArrangeAction::None => {}
         }
@@ -745,29 +752,30 @@ impl eframe::App for SignumApp {
                     match piano_roll_action {
                         PianoRollAction::TogglePlayback { clip_start_sample, clip_end_sample } => {
                             if self.engine.is_playing() {
-                                // Stop and return to start position, disable clip loop
+                                // Stop and return to start position
                                 self.engine.pause();
                                 self.engine.seek(self.playback_start_position);
-                                self.engine.with_timeline(|timeline| {
-                                    timeline.transport.loop_enabled = false;
-                                });
                             } else {
-                                // Save position, set loop to clip bounds, start playing
+                                // Save position and start playing
                                 self.playback_start_position = self.engine.position();
 
-                                // If position is outside clip, seek to clip start
-                                let current_pos = self.engine.position();
-                                if current_pos < clip_start_sample || current_pos >= clip_end_sample {
-                                    self.engine.seek(clip_start_sample);
-                                    self.playback_start_position = clip_start_sample;
+                                // If no loop is set, default to clip boundaries
+                                let loop_enabled = self.engine.is_loop_enabled();
+                                if !loop_enabled {
+                                    self.engine.with_timeline(|timeline| {
+                                        timeline.transport.loop_start = clip_start_sample;
+                                        timeline.transport.loop_end = clip_end_sample;
+                                        timeline.transport.loop_enabled = true;
+                                    });
                                 }
 
-                                // Set loop to clip boundaries
-                                self.engine.with_timeline(|timeline| {
-                                    timeline.transport.loop_start = clip_start_sample;
-                                    timeline.transport.loop_end = clip_end_sample;
-                                    timeline.transport.loop_enabled = true;
-                                });
+                                // If position is outside loop region, seek to loop start
+                                let (loop_start, loop_end) = self.engine.loop_region();
+                                let current_pos = self.engine.position();
+                                if current_pos < loop_start || current_pos >= loop_end {
+                                    self.engine.seek(loop_start);
+                                    self.playback_start_position = loop_start;
+                                }
 
                                 self.engine.play();
                             }
@@ -809,6 +817,23 @@ impl eframe::App for SignumApp {
                                     let mut instruments = self.engine_state.instruments.lock().unwrap();
                                     if let Some(inst) = instruments.get_mut(&id) {
                                         inst.queue_note_off(pitch, 0, 0, 0);
+                                    }
+                                }
+                            }
+                        }
+                        PianoRollAction::StopNotes { pitches } => {
+                            // Stop multiple notes (when deleting during playback)
+                            if let Some(SelectedClip::Midi { track_idx, .. }) = self.selected_clip {
+                                let inst_id = self.engine.with_timeline(|t| {
+                                    t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+                                }).flatten();
+
+                                if let Some(id) = inst_id {
+                                    let mut instruments = self.engine_state.instruments.lock().unwrap();
+                                    if let Some(inst) = instruments.get_mut(&id) {
+                                        for pitch in pitches {
+                                            inst.queue_note_off(pitch, 0, 0, 0);
+                                        }
                                     }
                                 }
                             }
@@ -923,7 +948,7 @@ impl eframe::App for SignumApp {
             // Get params from instrument (clone to release lock quickly)
             let params = {
                 let instruments = self.engine_state.instruments.lock().unwrap();
-                instruments.get(&window.id).map(|inst| inst.get_params())
+                instruments.get(&window.id).map(|inst| inst.get_params().to_vec())
             };
 
             egui::Window::new(&window.title)
@@ -1019,19 +1044,23 @@ impl eframe::App for SignumApp {
         let _ = self.gui_manager.process_events();
 
         // Sync component state changes (preset/patch loads) from native plugin GUIs
-        // TODO: State sync is currently disabled as it may cause audio issues
-        // Need to investigate proper VST3 state synchronization approach
-        // let state_changes = self.gui_manager.get_state_changes();
-        // if !state_changes.is_empty() {
-        //     let mut instruments = self.engine_state.instruments.lock().unwrap();
-        //     for (plugin_id, state) in state_changes {
-        //         if let Some(inst) = instruments.get_mut(&plugin_id) {
-        //             if let Err(e) = inst.set_state(&state) {
-        //                 tracing::warn!("Failed to sync plugin state: {}", e);
-        //             }
-        //         }
-        //     }
-        // }
+        let state_changes = self.gui_manager.get_state_changes();
+        if !state_changes.is_empty() {
+            tracing::info!("Syncing {} state changes from GUI", state_changes.len());
+            let mut instruments = self.engine_state.instruments.lock().unwrap();
+            for (plugin_id, state) in state_changes {
+                tracing::info!("Applying state ({} bytes) to plugin_id={}", state.len(), plugin_id);
+                if let Some(inst) = instruments.get_mut(&plugin_id) {
+                    if let Err(e) = inst.set_state(&state) {
+                        tracing::warn!("Failed to sync plugin state: {}", e);
+                    } else {
+                        tracing::info!("Successfully synced plugin state");
+                    }
+                } else {
+                    tracing::warn!("Plugin {} not found for state sync", plugin_id);
+                }
+            }
+        }
 
         // Sync parameter changes from native plugin GUIs to audio instruments
         let param_changes = self.gui_manager.get_parameter_changes();

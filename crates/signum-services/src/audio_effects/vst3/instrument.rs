@@ -50,23 +50,24 @@ impl Vst3Instrument {
             .map_err(|e| Vst3Error::LoadError(format!("{:?}", e)))?;
 
         // Build parameter map
-        let mut param_map = HashMap::new();
-        let mut param_cache = Vec::new();
         let param_count = instance.parameter_count();
-
-        for i in 0..param_count {
-            if let Ok(pinfo) = instance.parameter_info(i) {
-                param_map.insert(pinfo.name.clone(), i);
+        let param_data: Vec<_> = (0..param_count)
+            .filter_map(|i| {
+                let pinfo = instance.parameter_info(i).ok()?;
                 let current_value = instance.get_parameter(i).unwrap_or(pinfo.default);
-                param_cache.push(EffectParam::new(
-                    &pinfo.name,
-                    current_value,
-                    pinfo.min,
-                    pinfo.max,
-                    &pinfo.unit,
-                ));
-            }
-        }
+                Some((i, pinfo, current_value))
+            })
+            .collect();
+
+        let param_map: HashMap<_, _> = param_data
+            .iter()
+            .map(|(i, pinfo, _)| (pinfo.name.clone(), *i))
+            .collect();
+
+        let param_cache: Vec<_> = param_data
+            .into_iter()
+            .map(|(_, pinfo, value)| EffectParam::new(&pinfo.name, value, pinfo.min, pinfo.max, &pinfo.unit))
+            .collect();
 
         info!(name = %info.name, sample_rate, params = param_count, "VST3 instrument loaded");
 
@@ -91,15 +92,13 @@ impl Vst3Instrument {
     }
 
     /// Get all parameters
-    pub fn get_params(&self) -> Vec<EffectParam> {
-        self.param_cache.clone()
+    pub fn get_params(&self) -> &[EffectParam] {
+        &self.param_cache
     }
 
     /// Set a parameter by name
     pub fn set_param(&mut self, name: &str, value: f32) {
-        let Some(&index) = self.param_map.get(name) else {
-            return;
-        };
+        let Some(&index) = self.param_map.get(name) else { return };
 
         if let Err(e) = self.instance.set_parameter(index, value) {
             tracing::warn!("Failed to set parameter {}: {:?}", name, e);
@@ -107,20 +106,18 @@ impl Vst3Instrument {
         }
 
         // Update cache
-        if let Some(param) = self.param_cache.get_mut(index) {
-            param.value = value;
-        }
+        let Some(param) = self.param_cache.get_mut(index) else { return };
+        param.value = value;
     }
 
     /// Set a parameter by index (normalized 0-1)
     /// The rack crate expects normalized values directly
     pub fn set_param_by_index(&mut self, index: usize, normalized_value: f64) {
         let normalized = normalized_value as f32;
-        let total_params = self.instance.parameter_count();
 
         tracing::info!(
             "set_param_by_index: name={} index={} value={} total_params={}",
-            self.info.name, index, normalized, total_params
+            self.info.name, index, normalized, self.instance.parameter_count()
         );
 
         if let Err(e) = self.instance.set_parameter(index, normalized) {
@@ -131,27 +128,34 @@ impl Vst3Instrument {
         tracing::info!("Successfully set parameter {} = {}", index, normalized);
 
         // Update cache with denormalized value for display
-        if let Some(param) = self.param_cache.get_mut(index) {
-            param.value = param.min + normalized * (param.max - param.min);
-        }
+        let Some(param) = self.param_cache.get_mut(index) else { return };
+        param.value = param.min + normalized * (param.max - param.min);
     }
 
     /// Set the component state (for preset/patch sync)
     pub fn set_state(&mut self, data: &[u8]) -> Result<(), Vst3Error> {
+        tracing::info!("Vst3Instrument::set_state called with {} bytes", data.len());
+
+        // Reset the plugin before setting state to ensure clean state
+        if let Err(e) = self.instance.reset() {
+            tracing::warn!("Failed to reset before set_state: {:?}", e);
+        }
+
         self.instance
             .set_state(data)
             .map_err(|e| Vst3Error::LoadError(format!("Failed to set state: {:?}", e)))?;
 
+        tracing::info!("set_state succeeded, refreshing parameter cache");
+
         // Refresh parameter cache after state change
-        let param_count = self.instance.parameter_count();
-        for i in 0..param_count {
-            if let Ok(value) = self.instance.get_parameter(i) {
-                if let Some(param) = self.param_cache.get_mut(i) {
-                    // Convert normalized to display value
+        self.param_cache
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, param)| {
+                if let Ok(value) = self.instance.get_parameter(i) {
                     param.value = param.min + value * (param.max - param.min);
                 }
-            }
-        }
+            });
 
         Ok(())
     }
@@ -166,28 +170,27 @@ impl Vst3Instrument {
         self.pending_events.push(MidiEvent::note_off(pitch, velocity, channel, sample_offset));
     }
 
+    /// Send note off for all pitches (used when loop wraps to stop hanging notes)
+    pub fn all_notes_off(&mut self, sample_offset: u32) {
+        for pitch in 0..128u8 {
+            self.pending_events.push(MidiEvent::note_off(pitch, 0, 0, sample_offset));
+        }
+    }
+
     /// Process pending MIDI events and generate audio
     /// Returns stereo output buffers (left, right)
     pub fn process(&mut self, num_frames: usize) -> (&[f32], &[f32]) {
         let frames = num_frames.min(self.max_block_size);
 
         // Send queued MIDI to plugin
-        if !self.pending_events.is_empty() {
-            if let Err(e) = self.instance.send_midi(&self.pending_events) {
-                tracing::warn!("Failed to send MIDI: {:?}", e);
-            }
-            self.pending_events.clear();
-        }
+        self.flush_pending_midi();
 
         // Clear output buffers
         self.output_left[..frames].fill(0.0);
         self.output_right[..frames].fill(0.0);
 
-        // Process with silent input buffers (instruments generate audio from MIDI, not input)
-        let inputs: [&[f32]; 2] = [
-            &self.input_left[..frames],
-            &self.input_right[..frames],
-        ];
+        // Process with silent input buffers (instruments generate audio from MIDI)
+        let inputs: [&[f32]; 2] = [&self.input_left[..frames], &self.input_right[..frames]];
         let mut outputs: [&mut [f32]; 2] = [
             &mut self.output_left[..frames],
             &mut self.output_right[..frames],
@@ -198,6 +201,16 @@ impl Vst3Instrument {
         }
 
         (&self.output_left[..frames], &self.output_right[..frames])
+    }
+
+    fn flush_pending_midi(&mut self) {
+        if self.pending_events.is_empty() {
+            return;
+        }
+        if let Err(e) = self.instance.send_midi(&self.pending_events) {
+            tracing::warn!("Failed to send MIDI: {:?}", e);
+        }
+        self.pending_events.clear();
     }
 
     /// Set sample rate (reinitializes plugin)

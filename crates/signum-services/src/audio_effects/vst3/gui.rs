@@ -3,10 +3,12 @@
 //! This module provides native plugin GUI windows for VST3 plugins.
 //! On Linux, it creates X11 windows and embeds the plugin view using XEmbed.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+
 use thiserror::Error;
 use tracing::info;
 
@@ -92,7 +94,7 @@ impl PluginGuiManager {
 
     #[cfg(not(target_os = "linux"))]
     pub fn initialize(&mut self) -> Result<(), Vst3GuiError> {
-        warn!("Native plugin GUI not yet implemented for this platform");
+        tracing::warn!("Native plugin GUI not yet implemented for this platform");
         Ok(())
     }
 
@@ -247,17 +249,17 @@ impl PluginGuiManager {
 
         let window = self.windows.get_mut(&plugin_id)
             .ok_or(Vst3GuiError::PluginNotFound)?;
-
         let conn = self.x11_connection.as_ref()
             .ok_or_else(|| Vst3GuiError::X11Connection("Not initialized".to_string()))?;
+        let handle = window.native_handle
+            .ok_or(Vst3GuiError::WindowCreation("No native handle".to_string()))?;
 
-        if let Some(handle) = &window.native_handle {
-            conn.map_window(handle.x11_window)
-                .map_err(|e| Vst3GuiError::WindowCreation(e.to_string()))?;
-            conn.flush().map_err(|e| Vst3GuiError::WindowCreation(e.to_string()))?;
-            window.visible = true;
-            info!(plugin_id, "Showing plugin GUI window");
-        }
+        conn.map_window(handle.x11_window)
+            .map_err(|e| Vst3GuiError::WindowCreation(e.to_string()))?;
+        conn.flush()
+            .map_err(|e| Vst3GuiError::WindowCreation(e.to_string()))?;
+        window.visible = true;
+        info!(plugin_id, "Showing plugin GUI window");
 
         Ok(())
     }
@@ -278,16 +280,16 @@ impl PluginGuiManager {
 
         let window = self.windows.get_mut(&plugin_id)
             .ok_or(Vst3GuiError::PluginNotFound)?;
-
         let conn = self.x11_connection.as_ref()
             .ok_or_else(|| Vst3GuiError::X11Connection("Not initialized".to_string()))?;
+        let handle = window.native_handle
+            .ok_or(Vst3GuiError::WindowCreation("No native handle".to_string()))?;
 
-        if let Some(handle) = &window.native_handle {
-            conn.unmap_window(handle.x11_window)
-                .map_err(|e| Vst3GuiError::WindowCreation(e.to_string()))?;
-            conn.flush().map_err(|e| Vst3GuiError::WindowCreation(e.to_string()))?;
-            window.visible = false;
-        }
+        conn.unmap_window(handle.x11_window)
+            .map_err(|e| Vst3GuiError::WindowCreation(e.to_string()))?;
+        conn.flush()
+            .map_err(|e| Vst3GuiError::WindowCreation(e.to_string()))?;
+        window.visible = false;
 
         Ok(())
     }
@@ -306,22 +308,22 @@ impl PluginGuiManager {
         use x11rb::connection::Connection;
         use x11rb::protocol::xproto::ConnectionExt;
 
-        if let Some(mut window) = self.windows.remove(&plugin_id) {
-            // Detach VST3 plugin view first
-            if let Some(vst3_gui) = window.vst3_gui.take() {
-                vst3_gui.detach();
-                // vst3_gui will be dropped here, which calls vst3_gui_destroy
-            }
+        let Some(mut window) = self.windows.remove(&plugin_id) else {
+            return Ok(());
+        };
 
-            // Then destroy the X11 window
-            if let Some(handle) = window.native_handle {
-                if let Some(conn) = &self.x11_connection {
-                    let _ = conn.destroy_window(handle.x11_window);
-                    let _ = conn.flush();
-                }
-            }
-            info!(plugin_id, "Destroyed plugin GUI window");
+        // Detach VST3 plugin view first (will be dropped after detach)
+        if let Some(vst3_gui) = window.vst3_gui.take() {
+            vst3_gui.detach();
         }
+
+        // Destroy X11 window if both handle and connection exist
+        let Some(handle) = window.native_handle else { return Ok(()) };
+        let Some(conn) = &self.x11_connection else { return Ok(()) };
+
+        let _ = conn.destroy_window(handle.x11_window);
+        let _ = conn.flush();
+        info!(plugin_id, "Destroyed plugin GUI window");
 
         Ok(())
     }
@@ -347,16 +349,12 @@ impl PluginGuiManager {
     pub fn process_events(&self) -> Result<(), Vst3GuiError> {
         use x11rb::connection::Connection;
 
-        let conn = match &self.x11_connection {
-            Some(c) => c,
-            None => return Ok(()),
+        let Some(conn) = &self.x11_connection else {
+            return Ok(());
         };
 
-        // Process all pending events
-        while let Ok(Some(_event)) = conn.poll_for_event() {
-            // Events are handled by the plugin's embedded view
-            // We just need to pump the event queue
-        }
+        // Pump event queue - events handled by plugin's embedded view
+        while conn.poll_for_event().ok().flatten().is_some() {}
 
         Ok(())
     }
@@ -370,42 +368,42 @@ impl PluginGuiManager {
     /// Returns: Vec<(plugin_id, param_index, new_value)>
     #[cfg(target_os = "linux")]
     pub fn get_parameter_changes(&mut self) -> Vec<(u64, usize, f64)> {
+        static POLL_COUNTER: AtomicU32 = AtomicU32::new(0);
+
         let mut changes = Vec::new();
 
-        for window in self.windows.values_mut() {
-            let Some(ref gui) = window.vst3_gui else { continue };
-            if !window.visible { continue; }
+        for window in self.windows.values_mut().filter(|w| w.visible) {
+            let Some(ref gui) = window.vst3_gui else { return changes };
 
             let current_params = gui.get_all_parameters();
 
-            // Only log occasionally to avoid spam
-            static mut POLL_COUNTER: u32 = 0;
-            unsafe {
-                POLL_COUNTER += 1;
-                if POLL_COUNTER % 300 == 1 {
-                    // Log first 5 params every ~5 seconds at 60fps
-                    let preview: Vec<_> = current_params.iter().take(5).collect();
-                    tracing::debug!(
-                        "Polling params for plugin_id={}: first 5 = {:?}",
-                        window.plugin_id, preview
-                    );
-                }
+            // Log occasionally to avoid spam
+            let count = POLL_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if count % 300 == 0 {
+                let preview: Vec<_> = current_params.iter().take(5).collect();
+                tracing::debug!(
+                    "Polling params for plugin_id={}: first 5 = {:?}",
+                    window.plugin_id, preview
+                );
             }
 
-            // Compare with last known values
-            for (i, &new_val) in current_params.iter().enumerate() {
-                let old_val = window.last_params.get(i).copied().unwrap_or(0.0);
-                // Use a small threshold for floating point comparison
-                if (new_val - old_val).abs() > 0.0001 {
-                    tracing::info!(
-                        "GUI param change detected: plugin_id={} param[{}] {} -> {}",
-                        window.plugin_id, i, old_val, new_val
-                    );
-                    changes.push((window.plugin_id, i, new_val));
-                }
-            }
+            // Detect changed parameters
+            let window_changes: Vec<_> = current_params
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &new_val)| {
+                    let old_val = window.last_params.get(i).copied().unwrap_or(0.0);
+                    ((new_val - old_val).abs() > 0.0001).then(|| {
+                        tracing::info!(
+                            "GUI param change detected: plugin_id={} param[{}] {} -> {}",
+                            window.plugin_id, i, old_val, new_val
+                        );
+                        (window.plugin_id, i, new_val)
+                    })
+                })
+                .collect();
 
-            // Update last known values
+            changes.extend(window_changes);
             window.last_params = current_params;
         }
 
@@ -422,35 +420,32 @@ impl PluginGuiManager {
     /// Only checks every 30 frames (~0.5 sec at 60fps) to avoid overhead
     #[cfg(target_os = "linux")]
     pub fn get_state_changes(&mut self) -> Vec<(u64, Vec<u8>)> {
-        let mut changes = Vec::new();
+        self.windows
+            .values_mut()
+            .filter(|w| w.visible && w.vst3_gui.is_some())
+            .filter_map(|window| {
+                window.state_check_counter += 1;
+                if window.state_check_counter < 30 {
+                    return None;
+                }
+                window.state_check_counter = 0;
 
-        for window in self.windows.values_mut() {
-            let Some(ref gui) = window.vst3_gui else { continue };
-            if !window.visible { continue; }
+                let gui = window.vst3_gui.as_ref()?;
+                let current_state = gui.get_component_state().ok()?;
 
-            // Only check state periodically to reduce overhead
-            window.state_check_counter += 1;
-            if window.state_check_counter < 30 {
-                continue;
-            }
-            window.state_check_counter = 0;
+                let mut hasher = DefaultHasher::new();
+                current_state.hash(&mut hasher);
+                let current_hash = hasher.finish();
 
-            // Get current state and compute hash
-            let Ok(current_state) = gui.get_component_state() else { continue };
+                if current_hash == window.last_state_hash {
+                    return None;
+                }
 
-            let mut hasher = DefaultHasher::new();
-            current_state.hash(&mut hasher);
-            let current_hash = hasher.finish();
-
-            // Check if state changed
-            if current_hash != window.last_state_hash {
                 info!(plugin_id = window.plugin_id, "Component state changed (preset loaded)");
-                changes.push((window.plugin_id, current_state));
                 window.last_state_hash = current_hash;
-            }
-        }
-
-        changes
+                Some((window.plugin_id, current_state))
+            })
+            .collect()
     }
 
     #[cfg(not(target_os = "linux"))]

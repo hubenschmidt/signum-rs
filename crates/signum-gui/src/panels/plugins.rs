@@ -30,13 +30,17 @@ impl PluginBrowserPanel {
             .map(|h| h.join(".vst3"))
             .unwrap_or_else(|| PathBuf::from("~/.vst3"));
 
-        Self {
+        let mut panel = Self {
             scanner: None,
             plugins: Vec::new(),
             scan_error: None,
             custom_path: default_path.display().to_string(),
             use_custom_path: false,
-        }
+        };
+
+        // Auto-scan on init
+        panel.scan();
+        panel
     }
 
     /// Initialize scanner and scan for plugins
