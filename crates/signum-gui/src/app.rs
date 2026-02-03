@@ -1043,24 +1043,12 @@ impl eframe::App for SignumApp {
         // Process native window events
         let _ = self.gui_manager.process_events();
 
-        // Sync component state changes (preset/patch loads) from native plugin GUIs
-        let state_changes = self.gui_manager.get_state_changes();
-        if !state_changes.is_empty() {
-            tracing::info!("Syncing {} state changes from GUI", state_changes.len());
-            let mut instruments = self.engine_state.instruments.lock().unwrap();
-            for (plugin_id, state) in state_changes {
-                tracing::info!("Applying state ({} bytes) to plugin_id={}", state.len(), plugin_id);
-                if let Some(inst) = instruments.get_mut(&plugin_id) {
-                    if let Err(e) = inst.set_state(&state) {
-                        tracing::warn!("Failed to sync plugin state: {}", e);
-                    } else {
-                        tracing::info!("Successfully synced plugin state");
-                    }
-                } else {
-                    tracing::warn!("Plugin {} not found for state sync", plugin_id);
-                }
-            }
-        }
+        // NOTE: State syncing disabled - it was triggering on every parameter change
+        // and causing crashes with some plugins. Parameter changes are already synced
+        // via get_parameter_changes() below. Proper preset detection would need to
+        // distinguish between parameter edits and actual preset loads.
+        // let state_changes = self.gui_manager.get_state_changes();
+        // ...
 
         // Sync parameter changes from native plugin GUIs to audio instruments
         let param_changes = self.gui_manager.get_parameter_changes();

@@ -1,6 +1,6 @@
 //! VST3 instrument wrapper for MIDI-driven audio generation
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use rack::{midi::MidiEvent, Plugin, PluginInstance, PluginScanner, Scanner};
@@ -28,6 +28,8 @@ pub struct Vst3Instrument {
     param_map: HashMap<String, usize>,
     // Cached parameter info
     param_cache: Vec<EffectParam>,
+    // Track active notes (pitches with Note On but no Note Off yet)
+    active_notes: HashSet<u8>,
 }
 
 // Safety: We ensure single-threaded access via Mutex
@@ -83,6 +85,7 @@ impl Vst3Instrument {
             pending_events: Vec::with_capacity(256),
             param_map,
             param_cache,
+            active_notes: HashSet::new(),
         })
     }
 
@@ -162,17 +165,19 @@ impl Vst3Instrument {
 
     /// Queue a note on event
     pub fn queue_note_on(&mut self, pitch: u8, velocity: u8, channel: u8, sample_offset: u32) {
+        self.active_notes.insert(pitch);
         self.pending_events.push(MidiEvent::note_on(pitch, velocity, channel, sample_offset));
     }
 
     /// Queue a note off event
     pub fn queue_note_off(&mut self, pitch: u8, velocity: u8, channel: u8, sample_offset: u32) {
+        self.active_notes.remove(&pitch);
         self.pending_events.push(MidiEvent::note_off(pitch, velocity, channel, sample_offset));
     }
 
-    /// Send note off for all pitches (used when loop wraps to stop hanging notes)
+    /// Send note off for all currently active notes (used when loop wraps to stop hanging notes)
     pub fn all_notes_off(&mut self, sample_offset: u32) {
-        for pitch in 0..128u8 {
+        for pitch in self.active_notes.drain() {
             self.pending_events.push(MidiEvent::note_off(pitch, 0, 0, sample_offset));
         }
     }

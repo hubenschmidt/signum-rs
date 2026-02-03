@@ -217,6 +217,12 @@ impl AudioEngine {
                 let buffer_end = pos + num_frames as u64;
                 let spans_loop = loop_enabled && loop_end > loop_start && pos < loop_end && buffer_end > loop_end;
 
+                // Send note off for active notes at loop boundary to stop hanging notes
+                if spans_loop {
+                    let frames_before_loop = (loop_end - pos) as usize;
+                    instrument.all_notes_off(frames_before_loop as u32);
+                }
+
                 for clip in &track.midi_clips {
                     tracing::trace!("MIDI collect: pos={} buffer_end={} loop={}..{} spans={}", pos, buffer_end, loop_start, loop_end, spans_loop);
 
