@@ -8,7 +8,7 @@ use tracing::info;
 
 use super::error::Vst3Error;
 use super::scanner::Vst3PluginInfo;
-use crate::audio_effects::EffectParam;
+use crate::audio_effects::{AudioInstrument, EffectParam};
 
 /// VST3 instrument that generates audio from MIDI input
 pub struct Vst3Instrument {
@@ -135,34 +135,6 @@ impl Vst3Instrument {
         param.value = param.min + normalized * (param.max - param.min);
     }
 
-    /// Set the component state (for preset/patch sync)
-    pub fn set_state(&mut self, data: &[u8]) -> Result<(), Vst3Error> {
-        tracing::info!("Vst3Instrument::set_state called with {} bytes", data.len());
-
-        // Reset the plugin before setting state to ensure clean state
-        if let Err(e) = self.instance.reset() {
-            tracing::warn!("Failed to reset before set_state: {:?}", e);
-        }
-
-        self.instance
-            .set_state(data)
-            .map_err(|e| Vst3Error::LoadError(format!("Failed to set state: {:?}", e)))?;
-
-        tracing::info!("set_state succeeded, refreshing parameter cache");
-
-        // Refresh parameter cache after state change
-        self.param_cache
-            .iter_mut()
-            .enumerate()
-            .for_each(|(i, param)| {
-                if let Ok(value) = self.instance.get_parameter(i) {
-                    param.value = param.min + value * (param.max - param.min);
-                }
-            });
-
-        Ok(())
-    }
-
     /// Queue a note on event
     pub fn queue_note_on(&mut self, pitch: u8, velocity: u8, channel: u8, sample_offset: u32) {
         self.active_notes.insert(pitch);
@@ -238,5 +210,47 @@ impl fmt::Debug for Vst3Instrument {
             .field("name", &self.info.name)
             .field("pending_events", &self.pending_events.len())
             .finish()
+    }
+}
+
+impl AudioInstrument for Vst3Instrument {
+    fn name(&self) -> &str {
+        &self.info.name
+    }
+
+    fn queue_note_on(&mut self, pitch: u8, velocity: u8, channel: u8, sample_offset: u32) {
+        Vst3Instrument::queue_note_on(self, pitch, velocity, channel, sample_offset);
+    }
+
+    fn queue_note_off(&mut self, pitch: u8, velocity: u8, channel: u8, sample_offset: u32) {
+        Vst3Instrument::queue_note_off(self, pitch, velocity, channel, sample_offset);
+    }
+
+    fn all_notes_off(&mut self) {
+        Vst3Instrument::all_notes_off(self, 0);
+    }
+
+    fn process(&mut self, num_frames: usize) -> (&[f32], &[f32]) {
+        Vst3Instrument::process(self, num_frames)
+    }
+
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        Vst3Instrument::set_sample_rate(self, sample_rate);
+    }
+
+    fn get_params(&self) -> &[EffectParam] {
+        Vst3Instrument::get_params(self)
+    }
+
+    fn set_param(&mut self, name: &str, value: f32) {
+        Vst3Instrument::set_param(self, name, value);
+    }
+
+    fn set_param_by_index(&mut self, index: usize, value: f64) {
+        Vst3Instrument::set_param_by_index(self, index, value);
+    }
+
+    fn is_drum(&self) -> bool {
+        false
     }
 }

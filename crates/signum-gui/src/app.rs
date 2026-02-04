@@ -1,19 +1,25 @@
 //! Main application state
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use eframe::CreationContext;
 use egui::{Context, Vec2};
-use signum_core::{AudioClip, ClipId, MidiClip, TrackKind};
+use signum_core::{AudioClip, ClipId, MidiClip, PlaybackMode, SongSection, TrackKind};
 use signum_services::{
-    AudioEngine, EngineState, InputMonitor, MeterState, PluginGuiManager, Vst3Effect,
-    Vst3Instrument, Vst3PluginInfo,
+    AudioEngine, Drum808, EngineState, InputMonitor, Instrument, MeterState, PluginGuiManager,
+    Vst3Effect, Vst3Instrument, Vst3PluginInfo,
 };
 
 use crate::panels::{
     ArrangeAction, ArrangePanel, BrowserAction, BrowserPanel, ClipEditorPanel,
-    DeviceInfo, DeviceRackAction, DeviceRackPanel, PianoRollAction, PluginAction, PluginBrowserPanel,
-    RecordingPreview, TrackHeaderAction, TrackHeadersPanel, TransportAction, TransportPanel,
+    DeviceInfo, DeviceRackAction, DeviceRackPanel, DrumRollAction, DrumRollPanel,
+    KeyboardSequencerAction, KeyboardSequencerPanel,
+    MidiEffectType, MidiFxRackAction, MidiFxRackPanel,
+    PatternBankAction, PatternBankPanel,
+    PianoRollAction, PluginAction, PluginBrowserPanel,
+    RecordingPreview, SongViewAction, SongViewPanel,
+    TrackHeaderAction, TrackHeadersPanel, TransportAction, TransportPanel,
 };
 
 /// Floating plugin window state
@@ -47,6 +53,14 @@ pub struct SignumApp {
     arrange_panel: ArrangePanel,
     device_rack_panel: DeviceRackPanel,
     clip_editor_panel: ClipEditorPanel,
+    drum_roll_panel: DrumRollPanel,
+    pattern_bank_panel: PatternBankPanel,
+    keyboard_sequencer_panel: KeyboardSequencerPanel,
+    midi_fx_rack_panel: MidiFxRackPanel,
+    song_view_panel: SongViewPanel,
+
+    // Hapax panel visibility
+    show_hapax_panels: bool,
 
     // Selection state
     selected_track_idx: Option<usize>,
@@ -55,6 +69,7 @@ pub struct SignumApp {
 
     // Floating windows
     plugin_windows: Vec<PluginWindow>,
+    native_param_windows: HashSet<u64>,  // IDs of native instruments with open param windows
     gui_manager: PluginGuiManager,
 
     // ID counters
@@ -110,10 +125,17 @@ impl SignumApp {
             arrange_panel: ArrangePanel::new(),
             device_rack_panel: DeviceRackPanel::new(),
             clip_editor_panel: ClipEditorPanel::new(),
+            drum_roll_panel: DrumRollPanel::new(),
+            pattern_bank_panel: PatternBankPanel::new(),
+            keyboard_sequencer_panel: KeyboardSequencerPanel::new(),
+            midi_fx_rack_panel: MidiFxRackPanel::new(),
+            song_view_panel: SongViewPanel::new(),
+            show_hapax_panels: true,
             selected_track_idx: Some(0),
             selected_clip: None,
             show_clip_editor: false,
             plugin_windows: Vec::new(),
+            native_param_windows: HashSet::new(),
             gui_manager,
             next_clip_id: 1,
             next_instrument_id: 1,
@@ -247,6 +269,87 @@ impl SignumApp {
         tracing::info!("Added new MIDI track");
     }
 
+    fn load_native_drum(&mut self, inst_id_str: &str) {
+        // Currently only 808 is supported
+        if inst_id_str != "drum808" {
+            return;
+        }
+
+        let sample_rate = self.engine.sample_rate() as f32;
+        let drum808 = Drum808::new(sample_rate);
+
+        let inst_id = self.next_instrument_id;
+        self.next_instrument_id += 1;
+
+        self.engine.add_instrument(inst_id, Instrument::Drum808(drum808));
+
+        // Check if a MIDI track is selected - load there, else create new track
+        let selected_midi_track = self.selected_track_idx.and_then(|idx| {
+            self.engine.with_timeline(|timeline| {
+                timeline.tracks.get(idx).and_then(|t| {
+                    if t.kind == TrackKind::Midi { Some(idx) } else { None }
+                })
+            }).flatten()
+        });
+
+        let clip_id = self.next_clip_id;
+        self.next_clip_id += 1;
+
+        let track_idx = if let Some(idx) = selected_midi_track {
+            // Load to existing selected MIDI track
+            self.engine.with_timeline(|timeline| {
+                if let Some(track) = timeline.tracks.get_mut(idx) {
+                    track.instrument_id = Some(inst_id);
+                    track.name = "808 Drums".to_string();
+
+                    // Create a 4-bar MIDI clip if track has no clips
+                    if track.midi_clips.is_empty() {
+                        let sample_rate = timeline.transport.sample_rate;
+                        let bpm = timeline.transport.bpm;
+                        let samples_per_beat = sample_rate as f64 * 60.0 / bpm;
+                        let length_samples = (samples_per_beat * 16.0) as u64;
+
+                        let mut clip = MidiClip::new(ClipId(clip_id), length_samples);
+                        clip.name = "Drum Pattern".to_string();
+                        track.add_midi_clip(clip);
+                    }
+                }
+            });
+            Some(idx)
+        } else {
+            // Create new MIDI track
+            self.engine.with_timeline(|timeline| {
+                let idx = timeline.tracks.len();
+                timeline.add_track(TrackKind::Midi, "808 Drums");
+
+                let Some(track) = timeline.tracks.last_mut() else { return Some(idx) };
+                track.instrument_id = Some(inst_id);
+
+                let sample_rate = timeline.transport.sample_rate;
+                let bpm = timeline.transport.bpm;
+                let samples_per_beat = sample_rate as f64 * 60.0 / bpm;
+                let length_samples = (samples_per_beat * 16.0) as u64;
+
+                let mut clip = MidiClip::new(ClipId(clip_id), length_samples);
+                clip.name = "Drum Pattern".to_string();
+                track.add_midi_clip(clip);
+
+                Some(idx)
+            }).flatten()
+        };
+
+        if let Some(idx) = track_idx {
+            self.selected_track_idx = Some(idx);
+            self.selected_clip = Some(SelectedClip::Midi {
+                track_idx: idx,
+                clip_id: ClipId(clip_id),
+            });
+            self.show_clip_editor = true;
+        }
+
+        tracing::info!("Loaded 808 Drum Machine");
+    }
+
     fn load_vst3_effect(&mut self, info: &Vst3PluginInfo) {
         let Some(scanner) = self.plugin_menu.scanner() else { return };
         let Some(rack_scanner) = scanner.scanner() else { return };
@@ -291,7 +394,7 @@ impl SignumApp {
         self.next_instrument_id += 1;
 
         tracing::info!("Adding instrument with inst_id={}", inst_id);
-        self.engine.add_instrument(inst_id, instrument);
+        self.engine.add_instrument(inst_id, Instrument::Vst3(instrument));
 
         // Check if we have a selected MIDI track to add the instrument to
         let selected_midi_track = self.selected_track_idx.and_then(|idx| {
@@ -536,6 +639,8 @@ impl SignumApp {
     fn handle_device_rack_action(&mut self, action: DeviceRackAction) {
         match action {
             DeviceRackAction::OpenPluginWindow(id) => {
+                tracing::info!("OpenPluginWindow action for id={}", id);
+
                 // Check if native window already exists
                 if self.gui_manager.has_window(id) {
                     // Just show the existing window
@@ -545,21 +650,36 @@ impl SignumApp {
                     return;
                 }
 
-                // Get plugin info from instruments
+                // Get plugin info from instruments (VST3 only)
                 let plugin_info = {
                     let instruments = self.engine_state.instruments.lock().unwrap();
-                    instruments.get(&id).map(|inst| {
-                        let info = inst.plugin_info();
-                        (
+                    instruments.get(&id).and_then(|inst| {
+                        inst.vst3_plugin_info().map(|info| (
                             info.name.clone(),
                             info.info.path.to_string_lossy().to_string(),
                             info.info.unique_id.clone(),
-                        )
+                        ))
                     })
                 };
 
                 let Some((title, plugin_path, plugin_uid)) = plugin_info else {
-                    tracing::warn!("Plugin {} not found", id);
+                    // Not a VST3 plugin - check if it's a native instrument
+                    let is_native = {
+                        let instruments = self.engine_state.instruments.lock().unwrap();
+                        let result = instruments.get(&id).map(|i| i.is_drum()).unwrap_or(false);
+                        tracing::info!("Checking if id={} is native: {}", id, result);
+                        result
+                    };
+                    if is_native {
+                        // Toggle native param window
+                        if self.native_param_windows.contains(&id) {
+                            tracing::info!("Closing native param window for id={}", id);
+                            self.native_param_windows.remove(&id);
+                        } else {
+                            tracing::info!("Opening native param window for id={}", id);
+                            self.native_param_windows.insert(id);
+                        }
+                    }
                     return;
                 };
 
@@ -580,17 +700,23 @@ impl SignumApp {
     }
 
     fn get_device_info_for_track(&self, track_idx: usize) -> (Option<DeviceInfo>, Vec<DeviceInfo>) {
-        let instrument = self.engine.with_timeline(|timeline| {
-            timeline.tracks.get(track_idx).and_then(|track| {
-                track.instrument_id.map(|id| DeviceInfo {
-                    id,
-                    name: "Instrument".to_string(),
-                    is_instrument: true,
-                    is_bypassed: false,
-                    has_ui: true,
-                })
-            })
+        let inst_id = self.engine.with_timeline(|timeline| {
+            timeline.tracks.get(track_idx).and_then(|track| track.instrument_id)
         }).flatten();
+
+        let instrument = inst_id.map(|id| {
+            let instruments = self.engine_state.instruments.lock().unwrap();
+            let name = instruments.get(&id)
+                .map(|i| i.name().to_string())
+                .unwrap_or_else(|| "Instrument".to_string());
+            DeviceInfo {
+                id,
+                name,
+                is_instrument: true,
+                is_bypassed: false,
+                has_ui: true,
+            }
+        });
 
         // TODO: Get actual effect chain from track
         let effects = Vec::new();
@@ -602,6 +728,168 @@ impl SignumApp {
         self.plugin_menu.scanner()
             .map(|s| s.plugins().to_vec())
             .unwrap_or_default()
+    }
+
+    fn handle_pattern_bank_action(&mut self, action: PatternBankAction) {
+        let Some(track_idx) = self.selected_track_idx else { return };
+
+        match action {
+            PatternBankAction::SelectPattern(idx) => {
+                self.engine.with_timeline(|timeline| {
+                    if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                        track.pattern_bank.set_active(idx);
+                    }
+                });
+            }
+            PatternBankAction::QueuePattern(idx) => {
+                self.engine.with_timeline(|timeline| {
+                    if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                        track.pattern_bank.queue_pattern(idx);
+                    }
+                });
+            }
+            PatternBankAction::EditPattern(_idx) => {
+                // Open the pattern in the clip editor
+                self.show_clip_editor = true;
+            }
+            PatternBankAction::CopyPattern { from, to } => {
+                self.engine.with_timeline(|timeline| {
+                    if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                        track.pattern_bank.copy_pattern(from, to);
+                    }
+                });
+            }
+            PatternBankAction::ClearPattern(idx) => {
+                self.engine.with_timeline(|timeline| {
+                    if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                        track.pattern_bank.clear_pattern(idx);
+                    }
+                });
+            }
+            PatternBankAction::None => {}
+        }
+    }
+
+    fn handle_keyboard_sequencer_actions(&mut self, actions: Vec<KeyboardSequencerAction>) {
+        let Some(track_idx) = self.selected_track_idx else { return };
+
+        for action in actions {
+            match action {
+                KeyboardSequencerAction::ToggleDrumStep(step) => {
+                    // TODO: Store drum step state in track
+                    tracing::debug!("Toggle drum step {}", step);
+                }
+                KeyboardSequencerAction::PlayNote { pitch, velocity } => {
+                    let inst_id = self.engine.with_timeline(|t| {
+                        t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+                    }).flatten();
+                    if let Some(id) = inst_id {
+                        let mut instruments = self.engine_state.instruments.lock().unwrap();
+                        if let Some(inst) = instruments.get_mut(&id) {
+                            inst.queue_note_on(pitch, velocity, 0, 0);
+                        }
+                    }
+                }
+                KeyboardSequencerAction::StopNote { pitch } => {
+                    let inst_id = self.engine.with_timeline(|t| {
+                        t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+                    }).flatten();
+                    if let Some(id) = inst_id {
+                        let mut instruments = self.engine_state.instruments.lock().unwrap();
+                        if let Some(inst) = instruments.get_mut(&id) {
+                            inst.queue_note_off(pitch, 0, 0, 0);
+                        }
+                    }
+                }
+                KeyboardSequencerAction::None => {}
+            }
+        }
+    }
+
+    fn handle_midi_fx_rack_action(&mut self, action: MidiFxRackAction) {
+        let Some(track_idx) = self.selected_track_idx else { return };
+
+        match action {
+            MidiFxRackAction::AddEffect(effect_type) => {
+                let effect = effect_type.create_effect();
+                self.engine.with_timeline(|timeline| {
+                    if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                        track.midi_fx_chain.add(effect);
+                    }
+                });
+            }
+            MidiFxRackAction::RemoveEffect(idx) => {
+                self.engine.with_timeline(|timeline| {
+                    if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                        track.midi_fx_chain.remove(idx);
+                    }
+                });
+            }
+            MidiFxRackAction::ToggleBypass(idx) => {
+                self.engine.with_timeline(|timeline| {
+                    if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                        if let Some(effect) = track.midi_fx_chain.effects.get_mut(idx) {
+                            let bypassed = effect.is_bypassed();
+                            effect.set_bypass(!bypassed);
+                        }
+                    }
+                });
+            }
+            MidiFxRackAction::MoveEffect { from, to } => {
+                self.engine.with_timeline(|timeline| {
+                    if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                        let effects = &mut track.midi_fx_chain.effects;
+                        if from < effects.len() && to < effects.len() {
+                            let effect = effects.remove(from);
+                            effects.insert(to, effect);
+                        }
+                    }
+                });
+            }
+            MidiFxRackAction::SetParam { effect_idx, param_name, value } => {
+                self.engine.with_timeline(|timeline| {
+                    if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                        if let Some(effect) = track.midi_fx_chain.effects.get_mut(effect_idx) {
+                            effect.set_param(&param_name, value);
+                        }
+                    }
+                });
+            }
+            MidiFxRackAction::None => {}
+        }
+    }
+
+    fn handle_song_view_action(&mut self, action: SongViewAction) {
+        match action {
+            SongViewAction::SelectSection(_idx) => {
+                // Update selection - would need song arrangement in project
+            }
+            SongViewAction::AddSection => {
+                // Add new section
+            }
+            SongViewAction::RemoveSection(_idx) => {
+                // Remove section
+            }
+            SongViewAction::DuplicateSection(_idx) => {
+                // Duplicate section
+            }
+            SongViewAction::MoveSection { from: _, to: _ } => {
+                // Move section
+            }
+            SongViewAction::SetSectionLength { index: _, bars: _ } => {
+                // Set section length
+            }
+            SongViewAction::SetSectionRepeat { index: _, count: _ } => {
+                // Set section repeat count
+            }
+            SongViewAction::SetPlaybackMode(_mode) => {
+                // Toggle pattern/song mode
+            }
+            SongViewAction::JumpToSection(_idx) => {
+                // Jump playhead to section
+            }
+            SongViewAction::None => {}
+        }
     }
 
     /// Open native plugin GUI window directly (no egui parameter window)
@@ -667,10 +955,10 @@ impl eframe::App for SignumApp {
             TransportAction::None => {}
         }
 
-        // 3. Bottom panel: Device Rack (always visible, shorter)
+        // 3. Bottom panel: Device Rack (always visible, at very bottom)
         egui::TopBottomPanel::bottom("device_rack_panel")
             .resizable(false)
-            .exact_height(60.0)
+            .exact_height(110.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let track_name = self.selected_track_idx.and_then(|idx| {
@@ -686,14 +974,170 @@ impl eframe::App for SignumApp {
                     let action = self.device_rack_panel.ui(
                         ui,
                         track_name.as_deref(),
-                        instrument,
+                        instrument.clone(),
                         &effects,
                     );
+                    if !matches!(action, DeviceRackAction::None) {
+                        tracing::info!("Device rack action: {:?}, instrument: {:?}",
+                            match &action {
+                                DeviceRackAction::OpenPluginWindow(id) => format!("OpenPluginWindow({})", id),
+                                DeviceRackAction::ToggleBypass(id) => format!("ToggleBypass({})", id),
+                                DeviceRackAction::RemoveDevice(id) => format!("RemoveDevice({})", id),
+                                DeviceRackAction::AddEffect => "AddEffect".to_string(),
+                                DeviceRackAction::None => "None".to_string(),
+                            },
+                            instrument.as_ref().map(|i| format!("id={} name={}", i.id, i.name))
+                        );
+                    }
                     self.handle_device_rack_action(action);
                 });
             });
 
-        // 4. Clip Editor / Piano Roll panel (above device rack, only when clip selected)
+        // 3b. Hapax Sequencer panel (above device rack)
+        if self.show_hapax_panels {
+            egui::TopBottomPanel::bottom("hapax_panel")
+                .resizable(true)
+                .default_height(160.0)
+                .min_height(100.0)
+                .show(ctx, |ui| {
+                    // Get selected track info
+                    let (track_name, patterns, midi_fx_chain) = self.selected_track_idx
+                        .and_then(|idx| {
+                            self.engine.with_timeline(|timeline| {
+                                timeline.tracks.get(idx).map(|track| {
+                                    (
+                                        Some(track.name.clone()),
+                                        Some(track.pattern_bank.patterns.clone()),
+                                        Some(track.midi_fx_chain.clone()),
+                                    )
+                                })
+                            }).flatten()
+                        })
+                        .unwrap_or((None, None, None));
+
+                    ui.horizontal(|ui| {
+                        ui.heading("Sequencer");
+                        if let Some(name) = &track_name {
+                            ui.separator();
+                            ui.label(name);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Hide").clicked() {
+                                self.show_hapax_panels = false;
+                            }
+                            if ui.small_button("?").on_hover_text("Open docs/sequencer.md").clicked() {
+                                let _ = open::that("docs/sequencer.md");
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    // Get transport state for sequencer sync
+                    let (bpm, sample_rate) = self.engine.with_timeline(|t| {
+                        (t.transport.bpm, t.transport.sample_rate)
+                    }).unwrap_or((120.0, 44100));
+                    let playback_position = self.engine.position();
+                    let is_playing = self.engine.is_playing();
+
+                    // Horizontal layout: Keyboard (if docked) | MIDI FX | Song
+                    ui.horizontal(|ui| {
+                        // Keyboard Sequencer (left, only when docked)
+                        if !self.keyboard_sequencer_panel.is_floating {
+                            ui.group(|ui| {
+                                ui.set_min_width(400.0);
+                                let actions = self.keyboard_sequencer_panel.ui(
+                                    ui,
+                                    track_name.as_deref(),
+                                    playback_position,
+                                    bpm,
+                                    sample_rate,
+                                    is_playing,
+                                );
+                                self.handle_keyboard_sequencer_actions(actions);
+                            });
+                            ui.separator();
+                        }
+
+                        // MIDI FX
+                        ui.group(|ui| {
+                            ui.set_min_width(280.0);
+                            egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                                let action = self.midi_fx_rack_panel.ui(
+                                    ui,
+                                    track_name.as_deref(),
+                                    midi_fx_chain.as_ref(),
+                                );
+                                self.handle_midi_fx_rack_action(action);
+                            });
+                        });
+
+                        ui.separator();
+
+                        // Song View (right)
+                        ui.group(|ui| {
+                            ui.set_min_width(200.0);
+                            let (sections, current_section, playback_mode) = (
+                                vec![SongSection::default()],
+                                0usize,
+                                PlaybackMode::Pattern,
+                            );
+                            let action = self.song_view_panel.ui(
+                                ui,
+                                &sections,
+                                current_section,
+                                playback_mode,
+                            );
+                            self.handle_song_view_action(action);
+                        });
+                    });
+                });
+        } else {
+            // Show minimal bar to re-open
+            egui::TopBottomPanel::bottom("hapax_toggle")
+                .resizable(false)
+                .exact_height(20.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("▲ Show Sequencer").clicked() {
+                            self.show_hapax_panels = true;
+                        }
+                    });
+                });
+        }
+
+        // 3c. Floating keyboard sequencer window
+        if self.keyboard_sequencer_panel.is_floating {
+            let (bpm, sample_rate) = self.engine.with_timeline(|t| {
+                (t.transport.bpm, t.transport.sample_rate)
+            }).unwrap_or((120.0, 44100));
+            let playback_position = self.engine.position();
+            let is_playing = self.engine.is_playing();
+            let track_name: Option<String> = self.selected_track_idx.and_then(|idx| {
+                self.engine.with_timeline(|t| t.tracks.get(idx).map(|tr| tr.name.clone())).flatten()
+            });
+
+            let mut still_open = true;
+            egui::Window::new("HAPAX Sequencer")
+                .open(&mut still_open)
+                .resizable(true)
+                .default_size([1020.0, 460.0])
+                .show(ctx, |ui| {
+                    let actions = self.keyboard_sequencer_panel.ui(
+                        ui,
+                        track_name.as_deref(),
+                        playback_position,
+                        bpm,
+                        sample_rate,
+                        is_playing,
+                    );
+                    self.handle_keyboard_sequencer_actions(actions);
+                });
+            if !still_open {
+                self.keyboard_sequencer_panel.is_floating = false;
+            }
+        }
+
+        // 4. Clip Editor / Piano Roll panel (above sequencer, only when clip selected)
         if self.show_clip_editor {
             egui::TopBottomPanel::bottom("clip_editor_panel")
                 .resizable(true)
@@ -708,6 +1152,7 @@ impl eframe::App for SignumApp {
                     });
 
                     let mut piano_roll_action = PianoRollAction::None;
+                    let mut drum_roll_action = DrumRollAction::None;
 
                     if let Some(selected) = self.selected_clip {
                         match selected {
@@ -718,20 +1163,49 @@ impl eframe::App for SignumApp {
 
                                 let playback_position = self.engine.position();
 
-                                let action = self.engine.with_timeline(|timeline| {
-                                    if let Some(track) = timeline.tracks.get_mut(track_idx) {
-                                        if let Some(clip) = track.midi_clips.iter_mut().find(|c| c.id == clip_id) {
-                                            let clip_start = clip.start_sample;
-                                            return Some(self.clip_editor_panel.ui_midi(
-                                                ui, clip, bpm, sample_rate, clip_start, playback_position
-                                            ));
-                                        }
-                                    }
-                                    None
-                                }).flatten();
+                                // Check if this track uses a drum instrument
+                                let is_drum = self.engine.with_timeline(|timeline| {
+                                    timeline.tracks.get(track_idx)
+                                        .and_then(|track| track.instrument_id)
+                                }).flatten().map(|inst_id| {
+                                    let instruments = self.engine_state.instruments.lock().unwrap();
+                                    instruments.get(&inst_id).map(|i| i.is_drum()).unwrap_or(false)
+                                }).unwrap_or(false);
 
-                                if let Some(a) = action {
-                                    piano_roll_action = a;
+                                if is_drum {
+                                    // Use drum roll panel for drum instruments
+                                    let action = self.engine.with_timeline(|timeline| {
+                                        if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                                            if let Some(clip) = track.midi_clips.iter_mut().find(|c| c.id == clip_id) {
+                                                let clip_start = clip.start_sample;
+                                                return Some(self.drum_roll_panel.ui(
+                                                    ui, clip, bpm, sample_rate, clip_start, playback_position
+                                                ));
+                                            }
+                                        }
+                                        None
+                                    }).flatten();
+
+                                    if let Some(a) = action {
+                                        drum_roll_action = a;
+                                    }
+                                } else {
+                                    // Use piano roll panel for melodic instruments
+                                    let action = self.engine.with_timeline(|timeline| {
+                                        if let Some(track) = timeline.tracks.get_mut(track_idx) {
+                                            if let Some(clip) = track.midi_clips.iter_mut().find(|c| c.id == clip_id) {
+                                                let clip_start = clip.start_sample;
+                                                return Some(self.clip_editor_panel.ui_midi(
+                                                    ui, clip, bpm, sample_rate, clip_start, playback_position
+                                                ));
+                                            }
+                                        }
+                                        None
+                                    }).flatten();
+
+                                    if let Some(a) = action {
+                                        piano_roll_action = a;
+                                    }
                                 }
                             }
                             SelectedClip::Audio { track_idx, clip_id } => {
@@ -868,6 +1342,69 @@ impl eframe::App for SignumApp {
                         }
                         PianoRollAction::None => {}
                     }
+
+                    // Handle drum roll actions
+                    match drum_roll_action {
+                        DrumRollAction::TogglePlayback { clip_start_sample, clip_end_sample } => {
+                            if self.engine.is_playing() {
+                                self.engine.pause();
+                                self.engine.seek(self.playback_start_position);
+                            } else {
+                                self.playback_start_position = self.engine.position();
+                                let loop_enabled = self.engine.is_loop_enabled();
+                                if !loop_enabled {
+                                    self.engine.with_timeline(|timeline| {
+                                        timeline.transport.loop_start = clip_start_sample;
+                                        timeline.transport.loop_end = clip_end_sample;
+                                        timeline.transport.loop_enabled = true;
+                                    });
+                                }
+                                let (loop_start, loop_end) = self.engine.loop_region();
+                                let current_pos = self.engine.position();
+                                if current_pos < loop_start || current_pos >= loop_end {
+                                    self.engine.seek(loop_start);
+                                    self.playback_start_position = loop_start;
+                                }
+                                self.engine.play();
+                            }
+                        }
+                        DrumRollAction::ClipModified => {}
+                        DrumRollAction::PlayNote { pitch, velocity } => {
+                            if let Some(SelectedClip::Midi { track_idx, .. }) = self.selected_clip {
+                                let inst_id = self.engine.with_timeline(|t| {
+                                    t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+                                }).flatten();
+                                if let Some(id) = inst_id {
+                                    let mut instruments = self.engine_state.instruments.lock().unwrap();
+                                    if let Some(inst) = instruments.get_mut(&id) {
+                                        inst.queue_note_on(pitch, velocity, 0, 0);
+                                    }
+                                }
+                            }
+                        }
+                        DrumRollAction::StopNote { pitch } => {
+                            if let Some(SelectedClip::Midi { track_idx, .. }) = self.selected_clip {
+                                let inst_id = self.engine.with_timeline(|t| {
+                                    t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+                                }).flatten();
+                                if let Some(id) = inst_id {
+                                    let mut instruments = self.engine_state.instruments.lock().unwrap();
+                                    if let Some(inst) = instruments.get_mut(&id) {
+                                        inst.queue_note_off(pitch, 0, 0, 0);
+                                    }
+                                }
+                            }
+                        }
+                        DrumRollAction::SetLoopRegion { start_sample, end_sample } => {
+                            self.engine.with_timeline(|timeline| {
+                                timeline.transport.loop_start = start_sample;
+                                timeline.transport.loop_end = end_sample;
+                                timeline.transport.loop_enabled = true;
+                            });
+                            tracing::info!("Loop region set: {} - {}", start_sample, end_sample);
+                        }
+                        DrumRollAction::None => {}
+                    }
                 });
         }
 
@@ -882,6 +1419,7 @@ impl eframe::App for SignumApp {
                 match action {
                     BrowserAction::LoadEffect(info) => self.load_vst3_effect(&info),
                     BrowserAction::LoadInstrument(info) => self.load_instrument_to_track(&info),
+                    BrowserAction::LoadNativeInstrument(info) => self.load_native_drum(info.id),
                     BrowserAction::None => {}
                 }
             });
@@ -1014,6 +1552,61 @@ impl eframe::App for SignumApp {
             still_open
         });
 
+        // 7. Native instrument parameter windows (808, etc.)
+        let mut windows_to_close: Vec<u64> = Vec::new();
+        for &inst_id in &self.native_param_windows {
+            let mut still_open = true;
+
+            // Get instrument name and params
+            let (name, params) = {
+                let instruments = self.engine_state.instruments.lock().unwrap();
+                instruments.get(&inst_id).map(|inst| {
+                    (inst.name().to_string(), inst.get_params().to_vec())
+                }).unwrap_or_else(|| ("Unknown".to_string(), Vec::new()))
+            };
+
+            egui::Window::new(&name)
+                .id(egui::Id::new(format!("native_param_{}", inst_id)))
+                .open(&mut still_open)
+                .resizable(true)
+                .default_size([300.0, 400.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("{} parameters", params.len()));
+                    ui.separator();
+
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for param in &params {
+                            ui.horizontal(|ui| {
+                                ui.label(&param.name);
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if !param.unit.is_empty() {
+                                        ui.label(&param.unit);
+                                    }
+                                });
+                            });
+
+                            let mut value = param.value;
+                            let range = param.min..=param.max;
+                            let slider = egui::Slider::new(&mut value, range)
+                                .show_value(true)
+                                .clamping(egui::SliderClamping::Always);
+
+                            if ui.add(slider).changed() {
+                                param_updates.push((inst_id, param.name.clone(), value));
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+                });
+
+            if !still_open {
+                windows_to_close.push(inst_id);
+            }
+        }
+        for id in windows_to_close {
+            self.native_param_windows.remove(&id);
+        }
+
         // Create native windows for requested plugins
         for (id, path, uid, title) in native_window_requests {
             if let Err(e) = self.gui_manager.create_window(id, &path, &uid, &title, 800, 600) {
@@ -1043,12 +1636,18 @@ impl eframe::App for SignumApp {
         // Process native window events
         let _ = self.gui_manager.process_events();
 
-        // NOTE: State syncing disabled - it was triggering on every parameter change
-        // and causing crashes with some plugins. Parameter changes are already synced
-        // via get_parameter_changes() below. Proper preset detection would need to
-        // distinguish between parameter edits and actual preset loads.
-        // let state_changes = self.gui_manager.get_state_changes();
-        // ...
+        // NOTE: Full state/preset syncing from native plugin GUIs is disabled due to
+        // thread-safety issues with VST3 plugins. The GUI and audio are separate plugin
+        // instances. Parameter tweaks are synced via get_parameter_changes() below, but
+        // preset changes in the plugin's native UI won't affect audio playback.
+        // TODO: Consider sharing a single plugin instance between GUI and audio.
+        let _state_changes = self.gui_manager.get_state_changes();
+        if !_state_changes.is_empty() {
+            tracing::warn!(
+                "Preset changed in native plugin GUI - this won't affect audio playback. \
+                 Use the DAW's preset management instead."
+            );
+        }
 
         // Sync parameter changes from native plugin GUIs to audio instruments
         let param_changes = self.gui_manager.get_parameter_changes();

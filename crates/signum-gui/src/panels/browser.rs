@@ -3,12 +3,25 @@
 use egui::{CollapsingHeader, ScrollArea, Ui};
 use signum_services::Vst3PluginInfo;
 
+/// Info about a native (built-in) instrument
+#[derive(Clone)]
+pub struct NativeInstrumentInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+}
+
+/// Available native instruments
+pub const NATIVE_DRUMS: &[NativeInstrumentInfo] = &[
+    NativeInstrumentInfo { id: "drum808", name: "808 Drums" },
+];
+
 /// Action returned from browser panel
 #[derive(Clone)]
 pub enum BrowserAction {
     None,
     LoadEffect(Vst3PluginInfo),
     LoadInstrument(Vst3PluginInfo),
+    LoadNativeInstrument(NativeInstrumentInfo),
 }
 
 /// Browser panel state
@@ -37,6 +50,8 @@ impl BrowserPanel {
 
         ui.separator();
 
+        let filter_lower = self.filter_text.to_lowercase();
+
         ScrollArea::vertical().show(ui, |ui| {
             // Instruments section
             CollapsingHeader::new("🎹 Instruments")
@@ -59,11 +74,19 @@ impl BrowserPanel {
                     ui.label("Drag WAV files to import");
                 });
 
-            // Drums section (placeholder)
+            // Drums section - native drum instruments
             CollapsingHeader::new("🥁 Drums")
-                .default_open(false)
+                .default_open(true)
                 .show(ui, |ui| {
-                    ui.label("Coming soon...");
+                    for inst in NATIVE_DRUMS {
+                        let name_lower = inst.name.to_lowercase();
+                        if !filter_lower.is_empty() && !name_lower.contains(&filter_lower) {
+                            continue;
+                        }
+                        if ui.selectable_label(false, inst.name).double_clicked() {
+                            action = BrowserAction::LoadNativeInstrument(inst.clone());
+                        }
+                    }
                 });
         });
 

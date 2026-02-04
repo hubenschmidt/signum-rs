@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use signum_core::{MidiClip, Timeline, TrackKind};
+use signum_core::{MidiClip, MidiEvent, Timeline, TrackKind};
 use thiserror::Error;
 use tracing::info;
 
 use crate::audio_io::{AudioOutputError, RealtimeOutputStream};
-use crate::audio_effects::{EffectChain, Vst3Instrument};
+use crate::audio_effects::{EffectChain, Instrument};
 
 #[derive(Debug, Error)]
 pub enum AudioEngineError {
@@ -31,8 +31,8 @@ pub struct EngineState {
     pub timeline: Mutex<Timeline>,
     /// Master effect chain
     pub master_effects: Mutex<EffectChain>,
-    /// VST instruments keyed by instrument ID
-    pub instruments: Mutex<HashMap<u64, Vst3Instrument>>,
+    /// Instruments (VST3 or native) keyed by instrument ID
+    pub instruments: Mutex<HashMap<u64, Instrument>>,
     /// Per-track effect chains keyed by chain ID
     pub track_effects: Mutex<HashMap<u64, EffectChain>>,
 }
@@ -189,7 +189,7 @@ impl AudioEngine {
 
         // If playing, also lock timeline and queue MIDI events from clips
         let timeline_data = if is_playing {
-            let Ok(timeline) = state.timeline.lock() else {
+            let Ok(mut timeline) = state.timeline.lock() else {
                 drop(instruments);
                 buffer.fill(0.0);
                 return;
@@ -204,7 +204,7 @@ impl AudioEngine {
 
             // Queue MIDI events for each instrument from clips
             // Handle loop wrap: if buffer spans loop_end, collect from both regions
-            for track in timeline.tracks.iter().filter(|t| t.kind == TrackKind::Midi && !t.mute) {
+            for track in timeline.tracks.iter_mut().filter(|t| t.kind == TrackKind::Midi && !t.mute) {
                 let Some(inst_id) = track.instrument_id else {
                     tracing::trace!("MIDI track '{}' has no instrument", track.name);
                     continue;
@@ -218,10 +218,14 @@ impl AudioEngine {
                 let spans_loop = loop_enabled && loop_end > loop_start && pos < loop_end && buffer_end > loop_end;
 
                 // Send note off for active notes at loop boundary to stop hanging notes
-                if spans_loop {
+                // Skip for drum instruments - they're one-shot and should decay naturally
+                if spans_loop && !instrument.is_drum() {
                     let frames_before_loop = (loop_end - pos) as usize;
                     instrument.all_notes_off(frames_before_loop as u32);
                 }
+
+                // Collect raw MIDI events from all clips
+                let mut raw_events: Vec<MidiEvent> = Vec::new();
 
                 for clip in &track.midi_clips {
                     tracing::trace!("MIDI collect: pos={} buffer_end={} loop={}..{} spans={}", pos, buffer_end, loop_start, loop_end, spans_loop);
@@ -229,15 +233,25 @@ impl AudioEngine {
                     if spans_loop {
                         // Part 1: from pos to loop_end
                         let frames_before_loop = (loop_end - pos) as usize;
-                        Self::collect_midi_events(clip, pos, frames_before_loop, bpm, sample_rate, instrument);
+                        Self::collect_midi_events_raw(clip, pos, frames_before_loop, bpm, sample_rate, &mut raw_events, 0);
 
                         // Part 2: from loop_start for remaining frames
                         let frames_after_loop = num_frames - frames_before_loop;
-                        Self::collect_midi_events_with_offset(
-                            clip, loop_start, frames_after_loop, bpm, sample_rate, instrument, frames_before_loop as u32
-                        );
+                        Self::collect_midi_events_raw(clip, loop_start, frames_after_loop, bpm, sample_rate, &mut raw_events, frames_before_loop as u32);
                     } else {
-                        Self::collect_midi_events(clip, pos, num_frames, bpm, sample_rate, instrument);
+                        Self::collect_midi_events_raw(clip, pos, num_frames, bpm, sample_rate, &mut raw_events, 0);
+                    }
+                }
+
+                // Process through MIDI FX chain
+                let processed_events = track.midi_fx_chain.process(raw_events, sample_rate as f32, bpm);
+
+                // Queue processed events to instrument
+                for event in processed_events {
+                    if event.is_note_on {
+                        instrument.queue_note_on(event.pitch, event.velocity, event.channel, event.sample_offset.max(1));
+                    } else {
+                        instrument.queue_note_off(event.pitch, event.velocity, event.channel, event.sample_offset);
                     }
                 }
             }
@@ -307,26 +321,14 @@ impl AudioEngine {
         }
     }
 
-    /// Collect MIDI events from a clip that fall within the buffer window
-    fn collect_midi_events(
+    /// Collect MIDI events from a clip into a Vec (for MIDI FX processing)
+    fn collect_midi_events_raw(
         clip: &MidiClip,
         buffer_start: u64,
         buffer_frames: usize,
         bpm: f64,
         sample_rate: u32,
-        instrument: &mut Vst3Instrument,
-    ) {
-        Self::collect_midi_events_with_offset(clip, buffer_start, buffer_frames, bpm, sample_rate, instrument, 0);
-    }
-
-    /// Collect MIDI events with an additional offset (for loop wrap handling)
-    fn collect_midi_events_with_offset(
-        clip: &MidiClip,
-        buffer_start: u64,
-        buffer_frames: usize,
-        bpm: f64,
-        sample_rate: u32,
-        instrument: &mut Vst3Instrument,
+        events: &mut Vec<MidiEvent>,
         base_offset: u32,
     ) {
         let buffer_end = buffer_start + buffer_frames as u64;
@@ -345,16 +347,25 @@ impl AudioEngine {
             // Note On in this buffer?
             if note_start_sample >= buffer_start && note_start_sample < buffer_end {
                 let offset = base_offset + (note_start_sample - buffer_start) as u32;
-                // Use offset 1 minimum at loop start to avoid timing issues
-                let offset = offset.max(1);
-                tracing::debug!("Queueing note on: pitch={} offset={} buffer_start={}", note.pitch, offset, buffer_start);
-                instrument.queue_note_on(note.pitch, note.velocity, 0, offset);
+                events.push(MidiEvent {
+                    pitch: note.pitch,
+                    velocity: note.velocity,
+                    channel: 0,
+                    sample_offset: offset,
+                    is_note_on: true,
+                });
             }
 
             // Note Off in this buffer?
             if note_end_sample >= buffer_start && note_end_sample < buffer_end {
                 let offset = base_offset + (note_end_sample - buffer_start) as u32;
-                instrument.queue_note_off(note.pitch, 64, 0, offset);
+                events.push(MidiEvent {
+                    pitch: note.pitch,
+                    velocity: 64,
+                    channel: 0,
+                    sample_offset: offset,
+                    is_note_on: false,
+                });
             }
         }
     }
@@ -375,22 +386,22 @@ impl AudioEngine {
         self.state.master_effects.lock().ok().map(|mut e| f(&mut e))
     }
 
-    /// Add a VST instrument with the given ID
-    pub fn add_instrument(&self, id: u64, instrument: Vst3Instrument) {
+    /// Add an instrument with the given ID
+    pub fn add_instrument(&self, id: u64, instrument: Instrument) {
         if let Ok(mut instruments) = self.state.instruments.lock() {
             instruments.insert(id, instrument);
         }
     }
 
-    /// Remove a VST instrument by ID
-    pub fn remove_instrument(&self, id: u64) -> Option<Vst3Instrument> {
+    /// Remove an instrument by ID
+    pub fn remove_instrument(&self, id: u64) -> Option<Instrument> {
         self.state.instruments.lock().ok()?.remove(&id)
     }
 
     /// Access instruments for modification
     pub fn with_instruments<F, R>(&self, f: F) -> Option<R>
     where
-        F: FnOnce(&mut HashMap<u64, Vst3Instrument>) -> R,
+        F: FnOnce(&mut HashMap<u64, Instrument>) -> R,
     {
         self.state.instruments.lock().ok().map(|mut i| f(&mut i))
     }

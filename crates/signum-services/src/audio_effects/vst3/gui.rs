@@ -417,7 +417,7 @@ impl PluginGuiManager {
 
     /// Get component state changes (for preset/patch sync)
     /// Returns: Vec<(plugin_id, state_bytes)>
-    /// Only checks every 30 frames (~0.5 sec at 60fps) to avoid overhead
+    /// Checks every 60 frames (~1 sec at 60fps) to detect preset loads
     #[cfg(target_os = "linux")]
     pub fn get_state_changes(&mut self) -> Vec<(u64, Vec<u8>)> {
         self.windows
@@ -425,7 +425,7 @@ impl PluginGuiManager {
             .filter(|w| w.visible && w.vst3_gui.is_some())
             .filter_map(|window| {
                 window.state_check_counter += 1;
-                if window.state_check_counter < 30 {
+                if window.state_check_counter < 60 {
                     return None;
                 }
                 window.state_check_counter = 0;

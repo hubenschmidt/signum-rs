@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use crate::clip::{AudioClip, ClipId, MidiClip};
+use crate::midi_fx::MidiFxChain;
+use crate::pattern::PatternBank;
 
 /// Unique identifier for tracks
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -41,6 +43,12 @@ pub struct Track {
     pub instrument_id: Option<u64>,
     /// Assigned effect chain ID (for per-track effects)
     pub effect_chain_id: Option<u64>,
+    /// Pattern bank (16 patterns per track, Hapax-style)
+    #[serde(default)]
+    pub pattern_bank: PatternBank,
+    /// MIDI FX chain (up to 8 effects)
+    #[serde(default)]
+    pub midi_fx_chain: MidiFxChain,
 }
 
 impl Track {
@@ -58,6 +66,8 @@ impl Track {
             midi_clips: Vec::new(),
             instrument_id: None,
             effect_chain_id: None,
+            pattern_bank: PatternBank::default(),
+            midi_fx_chain: MidiFxChain::default(),
         }
     }
 
