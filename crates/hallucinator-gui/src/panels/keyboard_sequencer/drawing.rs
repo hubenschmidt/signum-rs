@@ -188,6 +188,7 @@ impl KeyboardSequencerPanel {
                         self.drum_steps[step].layers[row].active = !self.drum_steps[step].layers[row].active;
                         self.selected_step = Some(step);
                         self.active_drum_layer = row;
+                        actions.push(KeyboardSequencerAction::ToggleDrumStep(step));
                     }
 
                     // --- Drag ---
@@ -207,9 +208,11 @@ impl KeyboardSequencerPanel {
                         }
                         if has_sample && ui.button("Clear").clicked() {
                             self.drum_steps[step].layers[row].sample_name = None;
+                            self.drum_steps[step].layers[row].active = false;
                             if !self.drum_steps[step].has_any_sample() {
                                 self.drum_steps[step].active = false;
                             }
+                            actions.push(KeyboardSequencerAction::ClearStepSample { step, layer: row });
                             ui.close_menu();
                         }
                     });

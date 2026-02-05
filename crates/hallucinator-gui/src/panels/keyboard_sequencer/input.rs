@@ -39,8 +39,11 @@ impl KeyboardSequencerPanel {
 
         // Ctrl+C: copy selected step's active layer
         if ctrl && ui.input(|i| i.key_pressed(Key::C)) {
-            if let Some(sel) = self.selected_step {
-                if self.drum_steps[sel].layers[self.active_drum_layer].sample_name.is_some() {
+            tracing::debug!("Ctrl+C pressed, selected_step={:?}, active_layer={}", self.selected_step, self.active_drum_layer);
+            if let Some(sel) = self.selected_step.filter(|&s| s < self.drum_steps.len()) {
+                let has_sample = self.drum_steps[sel].layers[self.active_drum_layer].sample_name.is_some();
+                tracing::debug!("Copy check: step={} layer={} has_sample={}", sel, self.active_drum_layer, has_sample);
+                if has_sample {
                     actions.push(KeyboardSequencerAction::CopyDrumStep { step: sel, layer: self.active_drum_layer });
                 }
             }
@@ -51,14 +54,17 @@ impl KeyboardSequencerPanel {
         let paste = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))))
             || (ctrl && ui.input(|i| i.key_pressed(Key::V)));
         if paste {
-            if let Some(to) = self.selected_step {
-                actions.extend(self.paste_from_clipboard(clipboard, to, self.active_drum_layer));
+            tracing::debug!("Paste triggered, selected_step={:?}, clipboard_has_content={}", self.selected_step, clipboard.content().is_some());
+            if let Some(to) = self.selected_step.filter(|&s| s < self.drum_steps.len()) {
+                let paste_actions = self.paste_from_clipboard(clipboard, to, self.active_drum_layer);
+                tracing::debug!("Generated {} paste actions", paste_actions.len());
+                actions.extend(paste_actions);
             }
         }
 
         // Delete/Backspace: clear selected step's active layer sample
         let delete = ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace));
-        let step = self.selected_step;
+        let step = self.selected_step.filter(|&s| s < self.drum_steps.len());
         let layer = self.active_drum_layer;
         let has_sample = step.map(|s| self.drum_steps[s].layers[layer].sample_name.is_some()).unwrap_or(false);
 

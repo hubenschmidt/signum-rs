@@ -130,9 +130,7 @@ impl KeyboardSequencerPanel {
         let sc = self.step_count();
 
         // Read current step from audio thread (sample-accurate timing)
-        if is_playing {
-            self.current_step = engine_state.drum_current_step.load(Ordering::Relaxed) % sc;
-        }
+        self.current_step = engine_state.drum_current_step.load(Ordering::Relaxed) % sc;
 
         // Dark panel background
         let panel_rect = ui.available_rect_before_wrap();
@@ -143,6 +141,9 @@ impl KeyboardSequencerPanel {
 
         // Resize drum steps if scale changed
         self.drum_steps.resize(sc, DrumStep::default());
+        if self.selected_step.is_some_and(|s| s >= sc) {
+            self.selected_step = None;
+        }
         ui.add_space(2.0);
 
         // Input handling

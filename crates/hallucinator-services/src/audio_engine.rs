@@ -152,6 +152,7 @@ impl AudioEngine {
     pub fn stop_playback(&self) {
         self.state.playing.store(false, Ordering::SeqCst);
         self.state.position.store(0, Ordering::SeqCst);
+        self.state.drum_current_step.store(0, Ordering::SeqCst);
         if let Ok(mut timeline) = self.state.timeline.lock() {
             timeline.transport.stop();
         }
@@ -160,6 +161,10 @@ impl AudioEngine {
     /// Seek to position in samples
     pub fn seek(&self, position_samples: u64) {
         self.state.position.store(position_samples, Ordering::SeqCst);
+        // Reset drum step when seeking to start (common case: spacebar stop)
+        if position_samples == 0 {
+            self.state.drum_current_step.store(0, Ordering::SeqCst);
+        }
         if let Ok(mut timeline) = self.state.timeline.lock() {
             timeline.transport.position_samples = position_samples;
         }
@@ -312,27 +317,41 @@ impl AudioEngine {
                 }
             }
 
-            // Drum sequencer - sample-accurate step triggering
+            // Drum sequencer - sample-accurate step triggering (no allocations)
             if let Ok(pattern) = state.drum_pattern.lock() {
-                if pattern.step_count > 0 {
-                    if let Some(inst_id) = pattern.instrument_id {
-                        if let Some(Instrument::SampleKit(kit)) = instruments.get_mut(&inst_id) {
-                            let samples_per_step = (sample_rate as f64 * 60.0 / bpm) * 4.0 / pattern.step_count as f64;
-                            let mut current_step = state.drum_current_step.load(Ordering::Relaxed);
+                let step_count = pattern.step_count;
+                if step_count > 0 {
+                    let samples_per_step = (sample_rate as f64 * 60.0 / bpm) * 4.0 / step_count as f64;
+                    let mut current_step = state.drum_current_step.load(Ordering::Relaxed);
+                    let inst_id = pattern.instrument_id;
 
-                            for frame_idx in 0..num_frames {
-                                let abs_pos = pos + frame_idx as u64;
-                                let step = ((abs_pos as f64 / samples_per_step) as usize) % pattern.step_count;
+                    // Stack array for triggers (max 1 per step, 12 steps max)
+                    let mut trigger_count = 0usize;
+                    let mut trigger_buf: [(usize, u16, u32); 12] = [(0, 0, 0); 12];
 
-                                if step != current_step {
-                                    current_step = step;
-                                    let step_data = &pattern.steps[step];
-                                    if step_data.active && step_data.active_layers != 0 {
-                                        kit.queue_step_trigger(step, 100, step_data.active_layers, frame_idx as u32);
-                                    }
-                                }
+                    for frame_idx in 0..num_frames {
+                        let abs_pos = pos + frame_idx as u64;
+                        let step = ((abs_pos as f64 / samples_per_step) as usize) % step_count;
+                        if step == current_step { continue; }
+
+                        current_step = step;
+                        let step_data = &pattern.steps[step];
+                        if !step_data.active || step_data.active_layers == 0 { continue; }
+                        if trigger_count < 12 {
+                            trigger_buf[trigger_count] = (step, step_data.active_layers, frame_idx as u32);
+                            trigger_count += 1;
+                        }
+                    }
+                    state.drum_current_step.store(current_step, Ordering::Relaxed);
+                    drop(pattern);
+
+                    // Apply triggers outside pattern lock
+                    if let Some(id) = inst_id {
+                        if let Some(Instrument::SampleKit(kit)) = instruments.get_mut(&id) {
+                            for i in 0..trigger_count {
+                                let (step, layers, offset) = trigger_buf[i];
+                                kit.queue_step_trigger(step, 100, layers, offset);
                             }
-                            state.drum_current_step.store(current_step, Ordering::Relaxed);
                         }
                     }
                 }
