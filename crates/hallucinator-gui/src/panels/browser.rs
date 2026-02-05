@@ -119,21 +119,29 @@ fn render_tree(
             continue;
         }
         let item_id = egui::Id::new(&entry.path);
-        let resp = browser_item(ui, &entry.name, *selected_id == Some(item_id), true);
-        if resp.clicked() {
-            *selected_id = Some(item_id);
-            *action = BrowserAction::SelectFile(entry.path.clone());
-        }
-        // Double-click does nothing for audio files - use drag-and-drop instead
-        if resp.dragged() {
-            egui::DragAndDrop::set_payload(ui.ctx(), entry.path.clone());
-        }
-        resp.context_menu(|ui| {
-            if ui.button("Copy").clicked() {
+
+        ui.horizontal(|ui| {
+            // Preview button
+            if ui.small_button("▶").on_hover_text("Preview").clicked() {
+                *action = BrowserAction::PreviewSample(entry.path.clone());
+            }
+
+            // File name (clickable, draggable)
+            let resp = browser_item(ui, &entry.name, *selected_id == Some(item_id), true);
+            if resp.clicked() {
                 *selected_id = Some(item_id);
                 *action = BrowserAction::SelectFile(entry.path.clone());
-                ui.close_menu();
             }
+            if resp.dragged() {
+                egui::DragAndDrop::set_payload(ui.ctx(), entry.path.clone());
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Copy").clicked() {
+                    *selected_id = Some(item_id);
+                    *action = BrowserAction::SelectFile(entry.path.clone());
+                    ui.close_menu();
+                }
+            });
         });
     }
 }
@@ -177,6 +185,7 @@ pub enum BrowserAction {
     LoadInstrument(Vst3PluginInfo),
     LoadNativeInstrument(NativeInstrumentInfo),
     SelectFile(PathBuf),
+    PreviewSample(PathBuf),
     AddPlace(PathBuf),
     RemovePlace(usize),
 }

@@ -121,7 +121,7 @@ impl SampleKit {
         }
     }
 
-    /// Trigger active layers for a given step. `active_layers` is a bitmask (bit N = layer N).
+    /// Trigger active layers for a given step immediately. `active_layers` is a bitmask (bit N = layer N).
     pub fn trigger_step(&mut self, step: usize, velocity: u8, active_layers: u16) {
         let base = step * 12;
         for layer in 0..12u16 {
@@ -130,6 +130,19 @@ impl SampleKit {
             if slot < self.slots.len() && self.slots[slot].is_some() {
                 self.trigger_slot(slot, velocity);
             }
+        }
+    }
+
+    /// Queue step trigger at specific sample offset for sample-accurate timing.
+    pub fn queue_step_trigger(&mut self, step: usize, velocity: u8, active_layers: u16, sample_offset: u32) {
+        let base = step * 12;
+        for layer in 0..12u16 {
+            if active_layers & (1 << layer) == 0 { continue; }
+            let slot = base + layer as usize;
+            if slot >= self.slots.len() || self.slots[slot].is_none() { continue; }
+            // Convert slot to pitch for pending_events queue
+            let pitch = BASE_NOTE + (slot as u8);
+            self.pending_events.push((pitch, velocity, sample_offset));
         }
     }
 

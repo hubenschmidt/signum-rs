@@ -278,11 +278,6 @@ impl eframe::App for HallucinatorApp {
                     });
                     ui.separator();
 
-                    // Get transport state for sequencer sync
-                    let (bpm, sample_rate) = self.engine.with_timeline(|t| {
-                        (t.transport.bpm, t.transport.sample_rate)
-                    }).unwrap_or((120.0, 44100));
-                    let playback_position = self.engine.position();
                     let is_playing = self.engine.is_playing();
 
                     // Horizontal layout: Keyboard (if docked) | MIDI FX | Song
@@ -294,11 +289,9 @@ impl eframe::App for HallucinatorApp {
                                 let actions = self.keyboard_sequencer_panel.ui(
                                     ui,
                                     track_name.as_deref(),
-                                    playback_position,
-                                    bpm,
-                                    sample_rate,
                                     is_playing,
                                     &self.clipboard,
+                                    &self.engine_state,
                                 );
                                 self.handle_keyboard_sequencer_actions(actions);
                             });
@@ -354,10 +347,6 @@ impl eframe::App for HallucinatorApp {
 
         // 3c. Floating keyboard sequencer window
         if self.keyboard_sequencer_panel.is_floating {
-            let (bpm, sample_rate) = self.engine.with_timeline(|t| {
-                (t.transport.bpm, t.transport.sample_rate)
-            }).unwrap_or((120.0, 44100));
-            let playback_position = self.engine.position();
             let is_playing = self.engine.is_playing();
             let track_name: Option<String> = self.selected_track_idx.and_then(|idx| {
                 self.engine.with_timeline(|t| t.tracks.get(idx).map(|tr| tr.name.clone())).flatten()
@@ -372,11 +361,9 @@ impl eframe::App for HallucinatorApp {
                     let actions = self.keyboard_sequencer_panel.ui(
                         ui,
                         track_name.as_deref(),
-                        playback_position,
-                        bpm,
-                        sample_rate,
                         is_playing,
                         &self.clipboard,
+                        &self.engine_state,
                     );
                     self.handle_keyboard_sequencer_actions(actions);
                 });

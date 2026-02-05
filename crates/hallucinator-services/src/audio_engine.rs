@@ -1,7 +1,7 @@
 //! Audio engine for timeline playback
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hallucinator_core::{MidiClip, MidiEvent, Timeline, TrackKind};
@@ -21,6 +21,30 @@ pub enum AudioEngineError {
     NotRunning,
 }
 
+/// A single step in the drum pattern
+#[derive(Clone, Default)]
+pub struct DrumPatternStep {
+    pub active: bool,
+    pub active_layers: u16,
+}
+
+/// Drum pattern for sample-accurate sequencer triggering
+pub struct DrumPattern {
+    pub steps: [DrumPatternStep; 12],
+    pub step_count: usize,
+    pub instrument_id: Option<u64>,
+}
+
+impl Default for DrumPattern {
+    fn default() -> Self {
+        Self {
+            steps: std::array::from_fn(|_| DrumPatternStep::default()),
+            step_count: 8,
+            instrument_id: None,
+        }
+    }
+}
+
 /// Audio engine state shared between UI and audio thread
 pub struct EngineState {
     /// Current playback position in samples
@@ -35,6 +59,13 @@ pub struct EngineState {
     pub instruments: Mutex<HashMap<u64, Instrument>>,
     /// Per-track effect chains keyed by chain ID
     pub track_effects: Mutex<HashMap<u64, EffectChain>>,
+    /// Preview sample data (mono) and playback position
+    pub preview_sample: Mutex<Option<Vec<f32>>>,
+    pub preview_position: AtomicU64,
+    /// Drum pattern for sample-accurate sequencer
+    pub drum_pattern: Mutex<DrumPattern>,
+    /// Current drum step (for GUI display)
+    pub drum_current_step: AtomicUsize,
 }
 
 impl EngineState {
@@ -46,6 +77,10 @@ impl EngineState {
             master_effects: Mutex::new(EffectChain::new()),
             instruments: Mutex::new(HashMap::new()),
             track_effects: Mutex::new(HashMap::new()),
+            preview_sample: Mutex::new(None),
+            preview_position: AtomicU64::new(u64::MAX), // MAX = not playing
+            drum_pattern: Mutex::new(DrumPattern::default()),
+            drum_current_step: AtomicUsize::new(0),
         }
     }
 }
@@ -174,6 +209,27 @@ impl AudioEngine {
         self.sample_rate
     }
 
+    /// Preview a sample file (plays immediately, stops any current preview)
+    pub fn preview_sample(&self, path: &std::path::Path) {
+        let (mono, _sample_rate) = match crate::wav_reader::read_wav_mono(path) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!("Failed to load WAV for preview: {:?} - {}", path, e);
+                return;
+            }
+        };
+
+        if let Ok(mut preview) = self.state.preview_sample.lock() {
+            *preview = Some(mono);
+        }
+        self.state.preview_position.store(0, Ordering::SeqCst);
+    }
+
+    /// Stop any currently playing preview
+    pub fn stop_preview(&self) {
+        self.state.preview_position.store(u64::MAX, Ordering::SeqCst);
+    }
+
     /// Render audio into output buffer (called from audio thread)
     fn render_audio(state: &EngineState, buffer: &mut [f32], channels: u16) {
         let is_playing = state.playing.load(Ordering::SeqCst);
@@ -256,6 +312,32 @@ impl AudioEngine {
                 }
             }
 
+            // Drum sequencer - sample-accurate step triggering
+            if let Ok(pattern) = state.drum_pattern.lock() {
+                if pattern.step_count > 0 {
+                    if let Some(inst_id) = pattern.instrument_id {
+                        if let Some(Instrument::SampleKit(kit)) = instruments.get_mut(&inst_id) {
+                            let samples_per_step = (sample_rate as f64 * 60.0 / bpm) * 4.0 / pattern.step_count as f64;
+                            let mut current_step = state.drum_current_step.load(Ordering::Relaxed);
+
+                            for frame_idx in 0..num_frames {
+                                let abs_pos = pos + frame_idx as u64;
+                                let step = ((abs_pos as f64 / samples_per_step) as usize) % pattern.step_count;
+
+                                if step != current_step {
+                                    current_step = step;
+                                    let step_data = &pattern.steps[step];
+                                    if step_data.active && step_data.active_layers != 0 {
+                                        kit.queue_step_trigger(step, 100, step_data.active_layers, frame_idx as u32);
+                                    }
+                                }
+                            }
+                            state.drum_current_step.store(current_step, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+
             Some((duration, loop_enabled, loop_start, loop_end, timeline))
         } else {
             None
@@ -305,6 +387,9 @@ impl AudioEngine {
             }
         }
 
+        // Mix in preview sample if playing
+        Self::mix_preview(state, buffer, channels);
+
         // Apply master effects
         if let Ok(mut effects) = state.master_effects.lock() {
             let mut mono: Vec<f32> = buffer
@@ -319,6 +404,31 @@ impl AudioEngine {
                 frame.fill(sample);
             }
         }
+    }
+
+    /// Mix preview sample into buffer (called from audio thread)
+    fn mix_preview(state: &EngineState, buffer: &mut [f32], channels: usize) {
+        let preview_pos = state.preview_position.load(Ordering::SeqCst);
+        if preview_pos == u64::MAX {
+            return;
+        }
+
+        let Ok(preview) = state.preview_sample.lock() else { return };
+        let Some(samples) = preview.as_ref() else { return };
+
+        let mut pos = preview_pos as usize;
+        for frame in buffer.chunks_mut(channels) {
+            if pos >= samples.len() {
+                state.preview_position.store(u64::MAX, Ordering::SeqCst);
+                return;
+            }
+            let sample = samples[pos];
+            for ch in frame.iter_mut() {
+                *ch += sample;
+            }
+            pos += 1;
+        }
+        state.preview_position.store(pos as u64, Ordering::SeqCst);
     }
 
     /// Collect MIDI events from a clip into a Vec (for MIDI FX processing)

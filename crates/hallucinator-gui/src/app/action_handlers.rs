@@ -178,6 +178,9 @@ impl HallucinatorApp {
                 self.clipboard
                     .copy(crate::clipboard::ClipboardContent::FilePath(path));
             }
+            BrowserAction::PreviewSample(path) => {
+                self.engine.preview_sample(&path);
+            }
             BrowserAction::None => {}
         }
     }
@@ -190,10 +193,13 @@ impl HallucinatorApp {
             return;
         };
 
+        let mut pattern_changed = false;
+
         for action in actions {
             match action {
                 KeyboardSequencerAction::ToggleDrumStep(step) => {
                     tracing::debug!("Toggle drum step {}", step);
+                    pattern_changed = true;
                 }
                 KeyboardSequencerAction::PlayNote { pitch, velocity } => {
                     self.send_note_on(track_idx, pitch, velocity);
@@ -209,12 +215,14 @@ impl HallucinatorApp {
                         path
                     );
                     self.load_step_sample(track_idx, step, layer, &path);
+                    pattern_changed = true;
                 }
                 KeyboardSequencerAction::PlayDrumStep {
                     step,
                     velocity,
                     active_layers,
                 } => {
+                    // Manual preview trigger (keyboard input)
                     let inst_id = self
                         .engine
                         .with_timeline(|t| {
@@ -239,6 +247,7 @@ impl HallucinatorApp {
                     to_layer,
                 } => {
                     self.copy_step_sample(track_idx, from_step, from_layer, to_step, to_layer);
+                    pattern_changed = true;
                 }
                 KeyboardSequencerAction::MoveStepSample {
                     from_step,
@@ -249,6 +258,7 @@ impl HallucinatorApp {
                     self.copy_step_sample(track_idx, from_step, from_layer, to_step, to_layer);
                     self.clear_step_sample(track_idx, from_step, from_layer);
                     self.keyboard_sequencer_panel.clear_step_sample_name(from_step, from_layer);
+                    pattern_changed = true;
                 }
                 KeyboardSequencerAction::CopyDrumStep { step, layer } => {
                     tracing::debug!("CopyDrumStep step={} layer={}", step, layer);
@@ -267,11 +277,24 @@ impl HallucinatorApp {
                         name
                     );
                     self.paste_step_sample(track_idx, step, layer, name, data);
+                    pattern_changed = true;
                 }
                 KeyboardSequencerAction::ClearStepSample { step, layer } => {
                     self.clear_step_sample(track_idx, step, layer);
+                    pattern_changed = true;
                 }
             }
+        }
+
+        // Sync pattern to audio thread for sample-accurate playback
+        if pattern_changed {
+            let inst_id = self
+                .engine
+                .with_timeline(|t| {
+                    t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+                })
+                .flatten();
+            self.keyboard_sequencer_panel.sync_pattern_to_engine(&self.engine_state, inst_id);
         }
     }
 

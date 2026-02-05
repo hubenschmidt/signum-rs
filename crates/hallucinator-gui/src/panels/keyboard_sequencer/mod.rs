@@ -5,9 +5,12 @@ mod input;
 mod types;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use egui::{Key, Ui};
 use hallucinator_core::ScaleMode;
+use hallucinator_services::EngineState;
 
 pub use types::{DrumStep, KeyboardSequencerAction};
 use types::*;
@@ -92,6 +95,7 @@ impl KeyboardSequencerPanel {
         if step < self.drum_steps.len() && layer < 12 {
             self.drum_steps[step].layers[layer].sample_name = Some(name);
             self.drum_steps[step].layers[layer].active = true;
+            self.drum_steps[step].active = true;
         }
     }
 
@@ -102,37 +106,32 @@ impl KeyboardSequencerPanel {
         }
     }
 
+    /// Sync panel's drum pattern to engine state for sample-accurate playback
+    pub fn sync_pattern_to_engine(&self, engine_state: &Arc<EngineState>, instrument_id: Option<u64>) {
+        let Ok(mut pattern) = engine_state.drum_pattern.lock() else { return };
+        pattern.step_count = self.step_count();
+        pattern.instrument_id = instrument_id;
+        for (i, step) in self.drum_steps.iter().enumerate() {
+            if i >= 12 { break; }
+            pattern.steps[i].active = step.active;
+            pattern.steps[i].active_layers = step.active_layer_mask();
+        }
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut Ui,
         track_name: Option<&str>,
-        playback_position: u64,
-        bpm: f64,
-        sample_rate: u32,
         is_playing: bool,
         clipboard: &DawClipboard,
+        engine_state: &Arc<EngineState>,
     ) -> Vec<KeyboardSequencerAction> {
         let mut actions = Vec::new();
         let sc = self.step_count();
 
-        // Compute current step from playback position with elasticity
-        if is_playing && sample_rate > 0 {
-            let samples_per_beat = sample_rate as f64 * 60.0 / bpm;
-            let master_beat = playback_position as f64 / samples_per_beat;
-            let elastic_beat = master_beat * (1.0 + self.elasticity_pct / 100.0);
-            let new_step = (elastic_beat as usize) % sc;
-            if new_step != self.current_step {
-                let step = &self.drum_steps[new_step];
-                let mask = step.active_layer_mask();
-                if step.active && mask != 0 {
-                    actions.push(KeyboardSequencerAction::PlayDrumStep {
-                        step: new_step,
-                        velocity: self.base_velocity,
-                        active_layers: mask,
-                    });
-                }
-            }
-            self.current_step = new_step;
+        // Read current step from audio thread (sample-accurate timing)
+        if is_playing {
+            self.current_step = engine_state.drum_current_step.load(Ordering::Relaxed) % sc;
         }
 
         // Dark panel background
