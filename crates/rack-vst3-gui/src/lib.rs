@@ -1,4 +1,4 @@
-//! VST3 Native GUI support for signum-rs
+//! VST3 Native GUI support for hallucinator
 //!
 //! This crate provides native plugin GUI embedding via IPlugView.
 

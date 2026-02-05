@@ -1653,6 +1653,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "hallucinator-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hallucinator-gui"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "eframe",
+ "egui",
+ "hallucinator-core",
+ "hallucinator-services",
+ "hound",
+ "open",
+ "rack-vst3-gui",
+ "rfd",
+ "serde",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "x11rb",
+]
+
+[[package]]
+name = "hallucinator-services"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "crossbeam-channel",
+ "fastrand",
+ "fundsp",
+ "hallucinator-core",
+ "hound",
+ "rack",
+ "rack-vst3-gui",
+ "raw-window-handle",
+ "rubato",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+ "ureq",
+ "vst3",
+ "x11rb",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3323,56 +3373,6 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
-]
-
-[[package]]
-name = "signum-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "signum-gui"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "eframe",
- "egui",
- "hound",
- "open",
- "rack-vst3-gui",
- "rfd",
- "serde",
- "signum-core",
- "signum-services",
- "toml",
- "tracing",
- "tracing-subscriber",
- "x11rb",
-]
-
-[[package]]
-name = "signum-services"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "crossbeam-channel",
- "fastrand",
- "fundsp",
- "hound",
- "rack",
- "rack-vst3-gui",
- "raw-window-handle",
- "rubato",
- "serde",
- "signum-core",
- "thiserror 2.0.18",
- "tracing",
- "ureq",
- "vst3",
- "x11rb",
 ]
 
 [[package]]

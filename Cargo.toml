@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["signum-rs contributors"]
+authors = ["hallucinator contributors"]
 license = "MIT"
 
 [workspace.dependencies]
@@ -41,6 +41,6 @@ ureq = { version = "2.12", features = ["json"] }
 rack = { version = "0.4", features = ["vst3"] }
 
 # Internal crates
-signum-core = { path = "crates/signum-core" }
-signum-services = { path = "crates/signum-services" }
+hallucinator-core = { path = "crates/hallucinator-core" }
+hallucinator-services = { path = "crates/hallucinator-services" }
 rack-vst3-gui = { path = "crates/rack-vst3-gui" }

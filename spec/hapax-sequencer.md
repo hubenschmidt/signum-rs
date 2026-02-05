@@ -1,6 +1,6 @@
-# Hapax-Style Integrated Sequencer
+# Factory Rat-Style Integrated Sequencer
 
-A pattern-based sequencer inspired by the Squarp Hapax hardware sequencer, featuring real-time MIDI effects, algorithmic composition tools, and song arrangement.
+A pattern-based sequencer inspired by the Squarp Factory Rat hardware sequencer, featuring real-time MIDI effects, algorithmic composition tools, and song arrangement.
 
 ## Overview
 

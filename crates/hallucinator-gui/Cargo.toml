@@ -1,0 +1,22 @@
+[package]
+name = "hallucinator-gui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hallucinator-core = { workspace = true }
+hallucinator-services = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hound = { workspace = true }
+dirs = "5.0"
+open = "5"
+rfd = "0.17.2"
+toml = "0.9.11"
+serde = { workspace = true, features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rack-vst3-gui = { workspace = true }
+x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
