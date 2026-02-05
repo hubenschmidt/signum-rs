@@ -1,6 +1,7 @@
 //! Main application state
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::CreationContext;
@@ -8,9 +9,10 @@ use egui::{Context, Vec2};
 use signum_core::{AudioClip, ClipId, MidiClip, PlaybackMode, SongSection, TrackKind};
 use signum_services::{
     AudioEngine, Drum808, EngineState, InputMonitor, Instrument, MeterState, PluginGuiManager,
-    Vst3Effect, Vst3Instrument, Vst3PluginInfo,
+    SampleKit, Sampler, Vst3Effect, Vst3Instrument, Vst3PluginInfo,
 };
 
+use crate::clipboard::{ClipboardContent, DawClipboard};
 use crate::panels::{
     ArrangeAction, ArrangePanel, BrowserAction, BrowserPanel, ClipEditorPanel,
     DeviceInfo, DeviceRackAction, DeviceRackPanel, DrumRollAction, DrumRollPanel,
@@ -21,6 +23,44 @@ use crate::panels::{
     RecordingPreview, SongViewAction, SongViewPanel,
     TrackHeaderAction, TrackHeadersPanel, TransportAction, TransportPanel,
 };
+
+// ── App config persistence ──────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AppConfig {
+    #[serde(default)]
+    library: LibraryConfig,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct LibraryConfig {
+    #[serde(default)]
+    places: Vec<String>,
+}
+
+fn config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("signum")
+        .join("config.toml")
+}
+
+fn load_config() -> AppConfig {
+    let path = config_path();
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(config: &AppConfig) {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(s) = toml::to_string_pretty(config) else { return };
+    let _ = std::fs::write(&path, s);
+}
 
 /// Floating plugin window state
 struct PluginWindow {
@@ -59,6 +99,9 @@ pub struct SignumApp {
     midi_fx_rack_panel: MidiFxRackPanel,
     song_view_panel: SongViewPanel,
 
+    // App-wide clipboard
+    clipboard: DawClipboard,
+
     // Hapax panel visibility
     show_hapax_panels: bool,
 
@@ -82,6 +125,13 @@ pub struct SignumApp {
 
     // Playback start position (for space toggle return-to-start)
     playback_start_position: u64,
+}
+
+fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
+    if channels <= 1 { return samples.to_vec(); }
+    samples.chunks(channels)
+        .map(|ch| ch.iter().sum::<f32>() / channels as f32)
+        .collect()
 }
 
 impl SignumApp {
@@ -113,6 +163,12 @@ impl SignumApp {
             tracing::warn!("Failed to initialize native GUI manager: {}", e);
         }
 
+        // Load config and initialize sample library places
+        let config = load_config();
+        let mut browser_panel = BrowserPanel::new();
+        let place_paths: Vec<PathBuf> = config.library.places.iter().map(PathBuf::from).collect();
+        browser_panel.set_places(place_paths);
+
         Self {
             engine,
             engine_state,
@@ -120,7 +176,7 @@ impl SignumApp {
             meter_state,
             transport_panel: TransportPanel::new(),
             plugin_menu: PluginBrowserPanel::new(),
-            browser_panel: BrowserPanel::new(),
+            browser_panel,
             track_headers_panel: TrackHeadersPanel::new(),
             arrange_panel: ArrangePanel::new(),
             device_rack_panel: DeviceRackPanel::new(),
@@ -130,6 +186,7 @@ impl SignumApp {
             keyboard_sequencer_panel: KeyboardSequencerPanel::new(),
             midi_fx_rack_panel: MidiFxRackPanel::new(),
             song_view_panel: SongViewPanel::new(),
+            clipboard: DawClipboard::default(),
             show_hapax_panels: true,
             selected_track_idx: Some(0),
             selected_clip: None,
@@ -348,6 +405,99 @@ impl SignumApp {
         }
 
         tracing::info!("Loaded 808 Drum Machine");
+    }
+
+    fn save_library_config(&self) {
+        let config = AppConfig {
+            library: LibraryConfig {
+                places: self.browser_panel.place_paths().iter().map(|p| p.display().to_string()).collect(),
+            },
+        };
+        save_config(&config);
+    }
+
+    fn load_sample(&mut self, path: &std::path::Path) {
+        let engine_sr = self.engine.sample_rate() as f32;
+
+        let sampler = match Sampler::from_wav(path, engine_sr) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to load sample: {}", e);
+                return;
+            }
+        };
+
+        let inst_name = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Sample")
+            .to_string();
+        let inst_id = self.next_instrument_id;
+        self.next_instrument_id += 1;
+
+        self.engine.add_instrument(inst_id, Instrument::Sampler(sampler));
+
+        // Use selected MIDI track or create a new one (same pattern as load_native_drum)
+        let selected_midi_track = self.selected_track_idx.and_then(|idx| {
+            self.engine.with_timeline(|timeline| {
+                timeline.tracks.get(idx).and_then(|t| {
+                    if t.kind == TrackKind::Midi { Some(idx) } else { None }
+                })
+            }).flatten()
+        });
+
+        let clip_id = self.next_clip_id;
+        self.next_clip_id += 1;
+
+        let track_idx = if let Some(idx) = selected_midi_track {
+            self.engine.with_timeline(|timeline| {
+                if let Some(track) = timeline.tracks.get_mut(idx) {
+                    track.instrument_id = Some(inst_id);
+                    track.name = format!("Sample - {}", inst_name);
+
+                    if track.midi_clips.is_empty() {
+                        let sample_rate = timeline.transport.sample_rate;
+                        let bpm = timeline.transport.bpm;
+                        let samples_per_beat = sample_rate as f64 * 60.0 / bpm;
+                        let length_samples = (samples_per_beat * 16.0) as u64;
+
+                        let mut clip = MidiClip::new(ClipId(clip_id), length_samples);
+                        clip.name = "Sample Pattern".to_string();
+                        track.add_midi_clip(clip);
+                    }
+                }
+            });
+            Some(idx)
+        } else {
+            self.engine.with_timeline(|timeline| {
+                let idx = timeline.tracks.len();
+                timeline.add_track(TrackKind::Midi, format!("Sample - {}", inst_name));
+
+                let Some(track) = timeline.tracks.last_mut() else { return Some(idx) };
+                track.instrument_id = Some(inst_id);
+
+                let sample_rate = timeline.transport.sample_rate;
+                let bpm = timeline.transport.bpm;
+                let samples_per_beat = sample_rate as f64 * 60.0 / bpm;
+                let length_samples = (samples_per_beat * 16.0) as u64;
+
+                let mut clip = MidiClip::new(ClipId(clip_id), length_samples);
+                clip.name = "Sample Pattern".to_string();
+                track.add_midi_clip(clip);
+
+                Some(idx)
+            }).flatten()
+        };
+
+        if let Some(idx) = track_idx {
+            self.selected_track_idx = Some(idx);
+            self.selected_clip = Some(SelectedClip::Midi {
+                track_idx: idx,
+                clip_id: ClipId(clip_id),
+            });
+            self.show_clip_editor = true;
+        }
+
+        tracing::info!("Loaded sample: {}", path.display());
     }
 
     fn load_vst3_effect(&mut self, info: &Vst3PluginInfo) {
@@ -619,15 +769,6 @@ impl SignumApp {
             ArrangeAction::AddMidiTrack => {
                 self.add_empty_midi_track();
             }
-            ArrangeAction::TogglePlayback => {
-                if self.engine.is_playing() {
-                    self.engine.pause();
-                    self.engine.seek(self.playback_start_position);
-                } else {
-                    self.playback_start_position = self.engine.position();
-                    self.engine.play();
-                }
-            }
             ArrangeAction::SetLoopRegion { start_sample, end_sample } => {
                 self.engine.set_loop_region(start_sample, end_sample);
                 self.engine.set_loop_enabled(true);
@@ -776,7 +917,6 @@ impl SignumApp {
         for action in actions {
             match action {
                 KeyboardSequencerAction::ToggleDrumStep(step) => {
-                    // TODO: Store drum step state in track
                     tracing::debug!("Toggle drum step {}", step);
                 }
                 KeyboardSequencerAction::PlayNote { pitch, velocity } => {
@@ -801,9 +941,293 @@ impl SignumApp {
                         }
                     }
                 }
+                KeyboardSequencerAction::LoadStepSample { step, path } => {
+                    tracing::debug!("LoadStepSample step={} path={:?}", step, path);
+                    self.load_step_sample(track_idx, step, &path);
+                }
+                KeyboardSequencerAction::PlayDrumStep { step, velocity } => {
+                    let inst_id = self.engine.with_timeline(|t| {
+                        t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+                    }).flatten();
+                    if let Some(id) = inst_id {
+                        let mut instruments = self.engine_state.instruments.lock().unwrap();
+                        if let Some(inst) = instruments.get_mut(&id) {
+                            inst.queue_note_on(36 + step as u8, velocity, 0, 0);
+                        }
+                    }
+                }
+                KeyboardSequencerAction::CopyStepSample { from, to } => {
+                    self.copy_step_sample(track_idx, from, to);
+                }
+                KeyboardSequencerAction::CopyDrumStep(step) => {
+                    tracing::debug!("CopyDrumStep step={}", step);
+                    self.copy_drum_step_to_clipboard(track_idx, step);
+                }
+                KeyboardSequencerAction::PasteStepSample { step, name, data } => {
+                    tracing::debug!("PasteStepSample step={} name={}", step, name);
+                    self.paste_step_sample(track_idx, step, name, data);
+                }
                 KeyboardSequencerAction::None => {}
             }
         }
+    }
+
+    fn copy_step_sample(&mut self, track_idx: usize, from: usize, to: usize) {
+        let inst_id = self.engine.with_timeline(|t| {
+            t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+        }).flatten();
+        let Some(id) = inst_id else { return };
+
+        let mut instruments = self.engine_state.instruments.lock().unwrap();
+        let Some(Instrument::SampleKit(kit)) = instruments.get_mut(&id) else { return };
+
+        let (name, data) = {
+            let slots = kit.slots();
+            let Some(slot) = slots.get(from).and_then(|s| s.as_ref()) else { return };
+            (slot.name.clone(), Arc::clone(&slot.data))
+        };
+
+        kit.set_slot(to, name.clone(), data);
+        drop(instruments);
+
+        self.keyboard_sequencer_panel.set_step_sample_name(to, name);
+    }
+
+    fn copy_drum_step_to_clipboard(&mut self, track_idx: usize, step: usize) {
+        let inst_id = self.engine.with_timeline(|t| {
+            t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+        }).flatten();
+        let Some(id) = inst_id else { return };
+
+        let instruments = self.engine_state.instruments.lock().unwrap();
+        let Some(Instrument::SampleKit(kit)) = instruments.get(&id) else { return };
+        let slots = kit.slots();
+        let Some(slot) = slots.get(step).and_then(|s| s.as_ref()) else { return };
+
+        self.clipboard.copy(ClipboardContent::SampleData {
+            name: slot.name.clone(),
+            data: Arc::clone(&slot.data),
+        });
+    }
+
+    fn paste_step_sample(
+        &mut self,
+        track_idx: usize,
+        step: usize,
+        name: String,
+        data: Arc<Vec<f32>>,
+    ) {
+        let engine_sr = self.engine.sample_rate() as f32;
+
+        // Get or create SampleKit
+        let inst_id = self.engine.with_timeline(|t| {
+            t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+        }).flatten();
+
+        let kit_id = if let Some(id) = inst_id {
+            let is_kit = {
+                let instruments = self.engine_state.instruments.lock().unwrap();
+                instruments.get(&id).map(|i| matches!(i, Instrument::SampleKit(_))).unwrap_or(false)
+            };
+            if is_kit { id } else {
+                let new_id = self.next_instrument_id;
+                self.next_instrument_id += 1;
+                self.engine.add_instrument(new_id, Instrument::SampleKit(SampleKit::new(engine_sr)));
+                self.engine.with_timeline(|t| {
+                    if let Some(track) = t.tracks.get_mut(track_idx) {
+                        track.instrument_id = Some(new_id);
+                    }
+                });
+                new_id
+            }
+        } else {
+            let new_id = self.next_instrument_id;
+            self.next_instrument_id += 1;
+            self.engine.add_instrument(new_id, Instrument::SampleKit(SampleKit::new(engine_sr)));
+            self.engine.with_timeline(|t| {
+                if let Some(track) = t.tracks.get_mut(track_idx) {
+                    track.instrument_id = Some(new_id);
+                }
+            });
+            new_id
+        };
+
+        {
+            let mut instruments = self.engine_state.instruments.lock().unwrap();
+            if let Some(Instrument::SampleKit(kit)) = instruments.get_mut(&kit_id) {
+                kit.set_slot(step, name.clone(), data);
+            }
+        }
+
+        self.keyboard_sequencer_panel.set_step_sample_name(step, name);
+    }
+
+    fn load_step_sample(&mut self, track_idx: usize, step: usize, path: &std::path::Path) {
+        let engine_sr = self.engine.sample_rate() as f32;
+
+        let (mono, _sample_rate) = match Self::read_wav_samples(path) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("Failed to read WAV: {} — {}", path.display(), e);
+                return;
+            }
+        };
+
+        let sample_name = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("sample")
+            .to_string();
+
+        let data = Arc::new(mono);
+
+        // Get or create SampleKit instrument for this track
+        let inst_id = self.engine.with_timeline(|t| {
+            t.tracks.get(track_idx).and_then(|track| track.instrument_id)
+        }).flatten();
+
+        let kit_id = if let Some(id) = inst_id {
+            // Check if existing instrument is already a SampleKit
+            let is_kit = {
+                let instruments = self.engine_state.instruments.lock().unwrap();
+                instruments.get(&id).map(|i| matches!(i, Instrument::SampleKit(_))).unwrap_or(false)
+            };
+            if is_kit { id } else {
+                // Replace with a new SampleKit
+                let new_id = self.next_instrument_id;
+                self.next_instrument_id += 1;
+                self.engine.add_instrument(new_id, Instrument::SampleKit(SampleKit::new(engine_sr)));
+                self.engine.with_timeline(|t| {
+                    if let Some(track) = t.tracks.get_mut(track_idx) {
+                        track.instrument_id = Some(new_id);
+                    }
+                });
+                new_id
+            }
+        } else {
+            // No instrument on track — create SampleKit
+            let new_id = self.next_instrument_id;
+            self.next_instrument_id += 1;
+            self.engine.add_instrument(new_id, Instrument::SampleKit(SampleKit::new(engine_sr)));
+            self.engine.with_timeline(|t| {
+                if let Some(track) = t.tracks.get_mut(track_idx) {
+                    track.instrument_id = Some(new_id);
+                }
+            });
+            new_id
+        };
+
+        // Assign sample to slot
+        {
+            let mut instruments = self.engine_state.instruments.lock().unwrap();
+            if let Some(Instrument::SampleKit(kit)) = instruments.get_mut(&kit_id) {
+                kit.set_slot(step, sample_name.clone(), data);
+            }
+        }
+
+        // Update sequencer display
+        self.keyboard_sequencer_panel.set_step_sample_name(step, sample_name);
+        tracing::info!("Loaded sample to step {}: {}", step, path.display());
+    }
+
+    /// Read a WAV file to mono f32 samples. Tries hound first, falls back to
+    /// manual RIFF parsing for files with extended fmt chunks.
+    fn read_wav_samples(path: &std::path::Path) -> Result<(Vec<f32>, u32), String> {
+        // Try hound first (fast path for standard WAV)
+        if let Ok(mut reader) = hound::WavReader::open(path) {
+            let spec = reader.spec();
+            let samples: Vec<f32> = match spec.sample_format {
+                hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
+                hound::SampleFormat::Int => {
+                    let max_val = (1u64 << (spec.bits_per_sample - 1)) as f32;
+                    reader.samples::<i32>().filter_map(Result::ok).map(|s| s as f32 / max_val).collect()
+                }
+            };
+            let mono = to_mono(&samples, spec.channels as usize);
+            return Ok((mono, spec.sample_rate));
+        }
+
+        // Fallback: manual RIFF/WAVE parser (handles extended fmt chunks)
+        Self::read_wav_manual(path)
+    }
+
+    fn read_wav_manual(path: &std::path::Path) -> Result<(Vec<f32>, u32), String> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut f = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+        let mut buf4 = [0u8; 4];
+        let mut buf2 = [0u8; 2];
+
+        // RIFF header
+        f.read_exact(&mut buf4).map_err(|e| format!("read RIFF: {e}"))?;
+        if &buf4 != b"RIFF" { return Err("not RIFF".into()); }
+        f.read_exact(&mut buf4).ok(); // file size, skip
+        f.read_exact(&mut buf4).map_err(|e| format!("read WAVE: {e}"))?;
+        if &buf4 != b"WAVE" { return Err("not WAVE".into()); }
+
+        let mut sample_rate = 0u32;
+        let mut channels = 0u16;
+        let mut bits_per_sample = 0u16;
+        let mut audio_format = 0u16;
+        let mut data_bytes: Vec<u8> = Vec::new();
+
+        // Walk chunks
+        loop {
+            let Ok(()) = f.read_exact(&mut buf4) else { break };
+            let chunk_id = buf4;
+            let Ok(()) = f.read_exact(&mut buf4) else { break };
+            let chunk_size = u32::from_le_bytes(buf4);
+
+            if &chunk_id == b"fmt " {
+                f.read_exact(&mut buf2).map_err(|e| format!("fmt: {e}"))?;
+                audio_format = u16::from_le_bytes(buf2);
+                f.read_exact(&mut buf2).map_err(|e| format!("fmt: {e}"))?;
+                channels = u16::from_le_bytes(buf2);
+                f.read_exact(&mut buf4).map_err(|e| format!("fmt: {e}"))?;
+                sample_rate = u32::from_le_bytes(buf4);
+                f.read_exact(&mut buf4).ok(); // byte rate
+                f.read_exact(&mut buf2).ok(); // block align
+                f.read_exact(&mut buf2).map_err(|e| format!("fmt: {e}"))?;
+                bits_per_sample = u16::from_le_bytes(buf2);
+                // Skip remaining fmt bytes (extended chunk)
+                let read_so_far = 16u32;
+                if chunk_size > read_so_far {
+                    f.seek(SeekFrom::Current((chunk_size - read_so_far) as i64)).ok();
+                }
+                continue;
+            }
+
+            if &chunk_id == b"data" {
+                data_bytes.resize(chunk_size as usize, 0);
+                f.read_exact(&mut data_bytes).map_err(|e| format!("data: {e}"))?;
+                break;
+            }
+
+            // Skip unknown chunk
+            f.seek(SeekFrom::Current(chunk_size as i64)).ok();
+        }
+
+        if data_bytes.is_empty() { return Err("no data chunk".into()); }
+        if audio_format != 1 { return Err(format!("unsupported format {audio_format}")); }
+
+        let samples: Vec<f32> = match bits_per_sample {
+            16 => data_bytes.chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .collect(),
+            24 => data_bytes.chunks_exact(3)
+                .map(|b| {
+                    let val = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
+                    let signed = if val & 0x800000 != 0 { val | !0xFFFFFF } else { val };
+                    signed as f32 / 8388608.0
+                })
+                .collect(),
+            32 => data_bytes.chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2147483648.0)
+                .collect(),
+            _ => return Err(format!("unsupported bits {bits_per_sample}")),
+        };
+
+        let mono = to_mono(&samples, channels as usize);
+        Ok((mono, sample_rate))
     }
 
     fn handle_midi_fx_rack_action(&mut self, action: MidiFxRackAction) {
@@ -931,6 +1355,19 @@ impl eframe::App for SignumApp {
             }
         });
 
+        // Global spacebar → toggle playback (skip if a text field is focused)
+        let text_focused = ctx.memory(|mem| mem.focused().is_some())
+            && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_))));
+        if !text_focused && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            if self.engine.is_playing() {
+                self.engine.pause();
+                self.engine.seek(self.playback_start_position);
+            } else {
+                self.playback_start_position = self.engine.position();
+                self.engine.play();
+            }
+        }
+
         // 1. Menu bar
         let plugin_action = egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             self.plugin_menu.menu_ui(ui, &mut self.arrange_panel.snap_to_grid)
@@ -1052,6 +1489,7 @@ impl eframe::App for SignumApp {
                                     bpm,
                                     sample_rate,
                                     is_playing,
+                                    &self.clipboard,
                                 );
                                 self.handle_keyboard_sequencer_actions(actions);
                             });
@@ -1129,6 +1567,7 @@ impl eframe::App for SignumApp {
                         bpm,
                         sample_rate,
                         is_playing,
+                        &self.clipboard,
                     );
                     self.handle_keyboard_sequencer_actions(actions);
                 });
@@ -1179,7 +1618,7 @@ impl eframe::App for SignumApp {
                                             if let Some(clip) = track.midi_clips.iter_mut().find(|c| c.id == clip_id) {
                                                 let clip_start = clip.start_sample;
                                                 return Some(self.drum_roll_panel.ui(
-                                                    ui, clip, bpm, sample_rate, clip_start, playback_position
+                                                    ui, clip, bpm, sample_rate, clip_start, playback_position, &self.clipboard
                                                 ));
                                             }
                                         }
@@ -1196,7 +1635,7 @@ impl eframe::App for SignumApp {
                                             if let Some(clip) = track.midi_clips.iter_mut().find(|c| c.id == clip_id) {
                                                 let clip_start = clip.start_sample;
                                                 return Some(self.clip_editor_panel.ui_midi(
-                                                    ui, clip, bpm, sample_rate, clip_start, playback_position
+                                                    ui, clip, bpm, sample_rate, clip_start, playback_position, &self.clipboard
                                                 ));
                                             }
                                         }
@@ -1224,36 +1663,6 @@ impl eframe::App for SignumApp {
 
                     // Handle piano roll actions
                     match piano_roll_action {
-                        PianoRollAction::TogglePlayback { clip_start_sample, clip_end_sample } => {
-                            if self.engine.is_playing() {
-                                // Stop and return to start position
-                                self.engine.pause();
-                                self.engine.seek(self.playback_start_position);
-                            } else {
-                                // Save position and start playing
-                                self.playback_start_position = self.engine.position();
-
-                                // If no loop is set, default to clip boundaries
-                                let loop_enabled = self.engine.is_loop_enabled();
-                                if !loop_enabled {
-                                    self.engine.with_timeline(|timeline| {
-                                        timeline.transport.loop_start = clip_start_sample;
-                                        timeline.transport.loop_end = clip_end_sample;
-                                        timeline.transport.loop_enabled = true;
-                                    });
-                                }
-
-                                // If position is outside loop region, seek to loop start
-                                let (loop_start, loop_end) = self.engine.loop_region();
-                                let current_pos = self.engine.position();
-                                if current_pos < loop_start || current_pos >= loop_end {
-                                    self.engine.seek(loop_start);
-                                    self.playback_start_position = loop_start;
-                                }
-
-                                self.engine.play();
-                            }
-                        }
                         PianoRollAction::ClipModified => {
                             // Clip was modified - no additional action needed
                         }
@@ -1420,6 +1829,19 @@ impl eframe::App for SignumApp {
                     BrowserAction::LoadEffect(info) => self.load_vst3_effect(&info),
                     BrowserAction::LoadInstrument(info) => self.load_instrument_to_track(&info),
                     BrowserAction::LoadNativeInstrument(info) => self.load_native_drum(info.id),
+                    BrowserAction::LoadSample(path) => self.load_sample(&path),
+                    BrowserAction::AddPlace(path) => {
+                        self.browser_panel.add_place(path);
+                        self.save_library_config();
+                    }
+                    BrowserAction::RemovePlace(idx) => {
+                        self.browser_panel.remove_place(idx);
+                        self.save_library_config();
+                    }
+                    BrowserAction::SelectFile(path) => {
+                        tracing::debug!("Browser SelectFile → clipboard = {:?}", path);
+                        self.clipboard.copy(ClipboardContent::FilePath(path));
+                    }
                     BrowserAction::None => {}
                 }
             });
@@ -1471,6 +1893,7 @@ impl eframe::App for SignumApp {
                     self.selected_track_idx,
                     selected_clip_tuple,
                     recording_preview,
+                    &self.clipboard,
                 );
                 self.handle_arrange_action(action);
             });

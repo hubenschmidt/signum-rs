@@ -6,7 +6,7 @@ pub mod audio_input;
 pub mod audio_io;
 pub mod input_monitor;
 
-pub use audio_effects::{AudioEffect, EffectChain, EffectParam, Instrument};
+pub use audio_effects::{AudioEffect, EffectChain, EffectParam, Instrument, SampleKit, Sampler};
 pub use audio_effects::{GainEffect, HighPassEffect, LowPassEffect, CompressorEffect, DelayEffect, ReverbEffect};
 pub use audio_effects::{
     NativeWindowHandle, PluginGuiManager, Vst3Effect, Vst3Error, Vst3GuiError,

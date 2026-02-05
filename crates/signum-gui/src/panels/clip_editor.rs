@@ -1,5 +1,6 @@
 //! Clip editor panel - combines piano roll (MIDI) and waveform editor (audio)
 
+use crate::clipboard::DawClipboard;
 use egui::{Color32, Rect, Sense, Stroke, Ui, Vec2};
 use signum_core::{AudioClip, ClipId, MidiClip};
 
@@ -37,8 +38,9 @@ impl ClipEditorPanel {
         sample_rate: u32,
         clip_start_sample: u64,
         playback_position: u64,
+        clipboard: &DawClipboard,
     ) -> PianoRollAction {
-        self.piano_roll.ui(ui, clip, bpm, sample_rate, clip_start_sample, playback_position)
+        self.piano_roll.ui(ui, clip, bpm, sample_rate, clip_start_sample, playback_position, clipboard)
     }
 
     /// Render UI for audio clip (waveform editor)

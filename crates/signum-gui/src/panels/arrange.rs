@@ -3,6 +3,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crate::clipboard::DawClipboard;
 use egui::{Color32, Rect, Sense, Stroke, Ui, Vec2};
 use signum_core::{ClipId, Track, TrackKind};
 use signum_services::{AudioEngine, EngineState};
@@ -18,7 +19,6 @@ pub enum ArrangeAction {
     Seek(u64),
     AddAudioTrack,
     AddMidiTrack,
-    TogglePlayback,
     SetLoopRegion { start_sample: u64, end_sample: u64 },
 }
 
@@ -56,6 +56,7 @@ impl ArrangePanel {
         selected_track_idx: Option<usize>,
         selected_clip: Option<(usize, ClipId)>,
         recording_preview: Option<RecordingPreview>,
+        _clipboard: &DawClipboard,
     ) -> ArrangeAction {
         let mut action = ArrangeAction::None;
 
@@ -361,15 +362,6 @@ impl ArrangePanel {
                 let click_samples = (click_beat as f64 * samples_per_beat) as u64;
                 action = ArrangeAction::Seek(click_samples);
             }
-        }
-
-        // Handle spacebar to toggle playback (when hovering over arrange panel)
-        if response.hovered() {
-            ui.input(|i| {
-                if i.key_pressed(egui::Key::Space) {
-                    action = ArrangeAction::TogglePlayback;
-                }
-            });
         }
 
         // Handle right-click context menu on empty area

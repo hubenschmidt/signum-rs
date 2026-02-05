@@ -1,6 +1,7 @@
 //! signum-gui: DAW GUI application
 
 mod app;
+pub mod clipboard;
 mod panels;
 
 use app::SignumApp;

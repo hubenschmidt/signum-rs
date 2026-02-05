@@ -7,7 +7,7 @@ pub mod vst3;
 pub use native::{
     CompressorEffect, DelayEffect, GainEffect, HighPassEffect, LowPassEffect, ReverbEffect,
 };
-pub use native_instruments::Drum808;
+pub use native_instruments::{Drum808, SampleKit, Sampler};
 pub use vst3::{
     NativeWindowHandle, PluginGuiManager, PluginGuiWindow, Vst3Effect, Vst3Error,
     Vst3GuiError, Vst3Instrument, Vst3PluginInfo, Vst3Scanner,
@@ -61,6 +61,8 @@ pub trait AudioInstrument: Send {
 pub enum Instrument {
     Vst3(Vst3Instrument),
     Drum808(Drum808),
+    Sampler(Sampler),
+    SampleKit(SampleKit),
 }
 
 impl Instrument {
@@ -68,6 +70,8 @@ impl Instrument {
         match self {
             Self::Vst3(v) => v.name(),
             Self::Drum808(d) => d.name(),
+            Self::Sampler(s) => s.name(),
+            Self::SampleKit(k) => k.name(),
         }
     }
 
@@ -75,6 +79,8 @@ impl Instrument {
         match self {
             Self::Vst3(v) => v.queue_note_on(pitch, velocity, channel, sample_offset),
             Self::Drum808(d) => d.queue_note_on(pitch, velocity, channel, sample_offset),
+            Self::Sampler(s) => s.queue_note_on(pitch, velocity, channel, sample_offset),
+            Self::SampleKit(k) => k.queue_note_on(pitch, velocity, channel, sample_offset),
         }
     }
 
@@ -82,6 +88,8 @@ impl Instrument {
         match self {
             Self::Vst3(v) => v.queue_note_off(pitch, velocity, channel, sample_offset),
             Self::Drum808(d) => d.queue_note_off(pitch, velocity, channel, sample_offset),
+            Self::Sampler(s) => s.queue_note_off(pitch, velocity, channel, sample_offset),
+            Self::SampleKit(k) => k.queue_note_off(pitch, velocity, channel, sample_offset),
         }
     }
 
@@ -89,6 +97,8 @@ impl Instrument {
         match self {
             Self::Vst3(v) => v.all_notes_off(sample_offset),
             Self::Drum808(d) => { let _ = sample_offset; d.all_notes_off(); }
+            Self::Sampler(s) => { let _ = sample_offset; s.all_notes_off(); }
+            Self::SampleKit(k) => { let _ = sample_offset; k.all_notes_off(); }
         }
     }
 
@@ -96,6 +106,8 @@ impl Instrument {
         match self {
             Self::Vst3(v) => v.process(num_frames),
             Self::Drum808(d) => d.process(num_frames),
+            Self::Sampler(s) => s.process(num_frames),
+            Self::SampleKit(k) => k.process(num_frames),
         }
     }
 
@@ -103,6 +115,8 @@ impl Instrument {
         match self {
             Self::Vst3(v) => v.set_sample_rate(sample_rate),
             Self::Drum808(d) => d.set_sample_rate(sample_rate),
+            Self::Sampler(s) => s.set_sample_rate(sample_rate),
+            Self::SampleKit(k) => k.set_sample_rate(sample_rate),
         }
     }
 
@@ -110,6 +124,8 @@ impl Instrument {
         match self {
             Self::Vst3(v) => v.get_params(),
             Self::Drum808(d) => d.get_params(),
+            Self::Sampler(s) => s.get_params(),
+            Self::SampleKit(k) => k.get_params(),
         }
     }
 
@@ -117,6 +133,8 @@ impl Instrument {
         match self {
             Self::Vst3(v) => v.set_param(name, value),
             Self::Drum808(d) => d.set_param(name, value),
+            Self::Sampler(s) => s.set_param(name, value),
+            Self::SampleKit(k) => k.set_param(name, value),
         }
     }
 
@@ -124,6 +142,8 @@ impl Instrument {
         match self {
             Self::Vst3(v) => v.set_param_by_index(index, value),
             Self::Drum808(d) => d.set_param_by_index(index, value),
+            Self::Sampler(s) => s.set_param_by_index(index, value),
+            Self::SampleKit(k) => k.set_param_by_index(index, value),
         }
     }
 
@@ -131,6 +151,8 @@ impl Instrument {
         match self {
             Self::Vst3(_) => false,
             Self::Drum808(_) => true,
+            Self::Sampler(_) => false,
+            Self::SampleKit(_) => true,
         }
     }
 
@@ -138,7 +160,7 @@ impl Instrument {
     pub fn vst3_plugin_info(&self) -> Option<&Vst3PluginInfo> {
         match self {
             Self::Vst3(v) => Some(v.plugin_info()),
-            Self::Drum808(_) => None,
+            Self::Drum808(_) | Self::Sampler(_) | Self::SampleKit(_) => None,
         }
     }
 }

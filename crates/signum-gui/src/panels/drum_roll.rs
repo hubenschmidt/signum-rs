@@ -1,5 +1,6 @@
 //! Drum roll panel for 808-style drum sequencing
 
+use crate::clipboard::DawClipboard;
 use egui::{Color32, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 use signum_core::{ClipId, MidiClip, MidiNote};
 use signum_services::{
@@ -102,6 +103,7 @@ impl DrumRollPanel {
         sample_rate: u32,
         clip_start_sample: u64,
         playback_position: u64,
+        _clipboard: &DawClipboard,
     ) -> DrumRollAction {
         let mut action = DrumRollAction::None;
 
@@ -272,15 +274,6 @@ impl DrumRollPanel {
         if playback_beat >= start_beat && playback_beat <= end_beat {
             let x = grid_rect.min.x + ((playback_beat - start_beat) * self.pixels_per_beat as f64) as f32;
             painter.vline(x, grid_rect.min.y..=grid_rect.max.y, Stroke::new(2.0, Color32::from_rgb(255, 100, 100)));
-        }
-
-        // Handle spacebar for playback toggle
-        let space_pressed = ui.input(|i| i.key_pressed(Key::Space));
-        if space_pressed && response.hovered() {
-            action = DrumRollAction::TogglePlayback {
-                clip_start_sample,
-                clip_end_sample: clip_start_sample + clip.length_samples,
-            };
         }
 
         // Handle Ctrl+drag for loop selection

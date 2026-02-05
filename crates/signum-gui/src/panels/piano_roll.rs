@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use crate::clipboard::DawClipboard;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 use signum_core::{ClipId, MidiClip, MidiNote};
 
@@ -9,11 +10,6 @@ use signum_core::{ClipId, MidiClip, MidiNote};
 #[derive(Clone, Debug)]
 pub enum PianoRollAction {
     None,
-    /// Toggle playback within the clip boundaries
-    TogglePlayback {
-        clip_start_sample: u64,
-        clip_end_sample: u64,
-    },
     ClipModified,
     /// Set loop region from selection
     SetLoopRegion {
@@ -241,6 +237,7 @@ impl PianoRollPanel {
         sample_rate: u32,
         clip_start_sample: u64,
         playback_position: u64,
+        _clipboard: &DawClipboard,
     ) -> PianoRollAction {
         let mut action = PianoRollAction::None;
         let mut modified = false;
@@ -460,16 +457,6 @@ impl PianoRollPanel {
                         modified = true;
                     }
                 }
-            }
-        }
-
-        // Handle spacebar for playback toggle (within clip boundaries)
-        if response.hovered() {
-            if ui.input(|i| i.key_pressed(egui::Key::Space)) {
-                action = PianoRollAction::TogglePlayback {
-                    clip_start_sample,
-                    clip_end_sample: clip_start_sample + clip.length_samples,
-                };
             }
         }
 
