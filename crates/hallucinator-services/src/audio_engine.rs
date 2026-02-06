@@ -32,7 +32,12 @@ pub struct DrumPatternStep {
 pub struct DrumPattern {
     pub steps: [DrumPatternStep; 12],
     pub step_count: usize,
+    pub loop_bars: u8,
     pub instrument_id: Option<u64>,
+    /// When true, sync to transport loop; when false, loop independently
+    pub snap_to_arrange: bool,
+    /// Which rows are enabled (unmuted) - bit N = row N enabled
+    pub row_enabled: u16,
 }
 
 impl Default for DrumPattern {
@@ -40,7 +45,10 @@ impl Default for DrumPattern {
         Self {
             steps: std::array::from_fn(|_| DrumPatternStep::default()),
             step_count: 8,
+            loop_bars: 1,
             instrument_id: None,
+            snap_to_arrange: false,
+            row_enabled: 0xFFF,  // All 12 rows enabled by default
         }
     }
 }
@@ -66,6 +74,8 @@ pub struct EngineState {
     pub drum_pattern: Mutex<DrumPattern>,
     /// Current drum step (for GUI display)
     pub drum_current_step: AtomicUsize,
+    /// Independent drum position (increments continuously, ignores transport loop)
+    pub drum_position: AtomicU64,
 }
 
 impl EngineState {
@@ -81,6 +91,7 @@ impl EngineState {
             preview_position: AtomicU64::new(u64::MAX), // MAX = not playing
             drum_pattern: Mutex::new(DrumPattern::default()),
             drum_current_step: AtomicUsize::new(0),
+            drum_position: AtomicU64::new(0),
         }
     }
 }
@@ -321,17 +332,26 @@ impl AudioEngine {
             if let Ok(pattern) = state.drum_pattern.lock() {
                 let step_count = pattern.step_count;
                 if step_count > 0 {
-                    let samples_per_step = (sample_rate as f64 * 60.0 / bpm) * 4.0 / step_count as f64;
+                    // loop_bars * 4 beats per bar, divided by step_count
+                    let total_beats = 4.0 * pattern.loop_bars.max(1) as f64;
+                    let samples_per_step = (sample_rate as f64 * 60.0 / bpm) * total_beats / step_count as f64;
+                    let pattern_length_samples = samples_per_step * step_count as f64;
+                    let snap = pattern.snap_to_arrange;
                     let mut current_step = state.drum_current_step.load(Ordering::Relaxed);
                     let inst_id = pattern.instrument_id;
+
+                    // Free mode uses independent drum_position; Snap mode uses transport pos
+                    let drum_base = state.drum_position.load(Ordering::Relaxed);
 
                     // Stack array for triggers (max 1 per step, 12 steps max)
                     let mut trigger_count = 0usize;
                     let mut trigger_buf: [(usize, u16, u32); 12] = [(0, 0, 0); 12];
 
                     for frame_idx in 0..num_frames {
-                        let abs_pos = pos + frame_idx as u64;
-                        let step = ((abs_pos as f64 / samples_per_step) as usize) % step_count;
+                        // Snap: use transport position; Free: use independent drum position
+                        let raw_pos = if snap { pos + frame_idx as u64 } else { drum_base + frame_idx as u64 };
+                        let drum_pos = (raw_pos as f64) % pattern_length_samples;
+                        let step = (drum_pos / samples_per_step) as usize % step_count;
                         if step == current_step { continue; }
 
                         current_step = step;
@@ -343,14 +363,25 @@ impl AudioEngine {
                         }
                     }
                     state.drum_current_step.store(current_step, Ordering::Relaxed);
+
+                    // Capture row_enabled before dropping pattern lock
+                    let row_enabled = pattern.row_enabled;
+
+                    // Increment independent drum position (always, so Free mode keeps running)
+                    state.drum_position.fetch_add(num_frames as u64, Ordering::Relaxed);
+
                     drop(pattern);
 
-                    // Apply triggers outside pattern lock
+                    // Apply triggers outside pattern lock (row-based model: slot = row)
+                    // Mask with row_enabled to respect muted rows
                     if let Some(id) = inst_id {
                         if let Some(Instrument::SampleKit(kit)) = instruments.get_mut(&id) {
                             for i in 0..trigger_count {
-                                let (step, layers, offset) = trigger_buf[i];
-                                kit.queue_step_trigger(step, 100, layers, offset);
+                                let (_step, active_rows, offset) = trigger_buf[i];
+                                let enabled_rows = active_rows & row_enabled;
+                                if enabled_rows != 0 {
+                                    kit.queue_row_triggers(enabled_rows, 100, offset);
+                                }
                             }
                         }
                     }

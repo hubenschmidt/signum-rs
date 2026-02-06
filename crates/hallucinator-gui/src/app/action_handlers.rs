@@ -283,6 +283,29 @@ impl HallucinatorApp {
                     self.clear_step_sample(track_idx, step, layer);
                     pattern_changed = true;
                 }
+                KeyboardSequencerAction::LoadRowSample { row, path } => {
+                    tracing::debug!("LoadRowSample row={} path={:?}", row, path);
+                    self.load_row_sample(track_idx, row, &path);
+                }
+                KeyboardSequencerAction::PlayRowSample { row, velocity } => {
+                    self.play_row_sample(track_idx, row, velocity);
+                }
+                KeyboardSequencerAction::CopyRowSample { row } => {
+                    self.copy_row_sample_to_clipboard(track_idx, row);
+                }
+                KeyboardSequencerAction::PasteRowSample { row } => {
+                    self.paste_row_sample_from_clipboard(track_idx, row);
+                }
+                KeyboardSequencerAction::ClearRowSample { row } => {
+                    self.clear_row_sample(track_idx, row);
+                }
+                KeyboardSequencerAction::MoveRowSample { from_row, to_row } => {
+                    self.move_row_sample(track_idx, from_row, to_row);
+                }
+                KeyboardSequencerAction::ToggleRowEnabled { row: _ } => {
+                    // State already toggled in UI, just mark pattern as changed
+                    pattern_changed = true;
+                }
             }
         }
 

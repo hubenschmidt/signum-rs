@@ -148,8 +148,126 @@ pub enum KeyboardSequencerAction {
     MoveStepSample { from_step: usize, from_layer: usize, to_step: usize, to_layer: usize },
     PasteStepSample { step: usize, layer: usize, name: String, data: Arc<Vec<f32>> },
     ClearStepSample { step: usize, layer: usize },
+    /// Load a sample for an entire row (layer)
+    LoadRowSample { row: usize, path: PathBuf },
+    /// Play a row's sample (triggered by key press)
+    PlayRowSample { row: usize, velocity: u8 },
+    /// Copy a row's sample to clipboard
+    CopyRowSample { row: usize },
+    /// Paste sample from clipboard to row
+    PasteRowSample { row: usize },
+    /// Clear a row's sample
+    ClearRowSample { row: usize },
+    /// Move sample from one row to another
+    MoveRowSample { from_row: usize, to_row: usize },
+    /// Toggle row enabled/muted state
+    ToggleRowEnabled { row: usize },
 }
 
 /// Payload for dragging a drum step within the sequencer (step, layer)
 #[derive(Clone)]
 pub(super) struct DragStep(pub usize, pub usize);
+
+/// Payload for dragging a row sample
+#[derive(Clone)]
+pub(super) struct DragRowSample(pub usize);
+
+/// Which row of the sequencer is active for keyboard input
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SequencerRow {
+    /// Drum layer in expanded grid (0-11, displayed as 1-12)
+    DrumLayer(usize),
+    #[default]
+    Drum,
+    Octave3,
+    Octave4,
+    Octave5,
+}
+
+impl SequencerRow {
+    /// Cycle to the next row (Tab). When drum_expanded, includes drum layers.
+    pub fn next(self, drum_expanded: bool) -> Self {
+        match self {
+            Self::DrumLayer(layer) if layer > 0 => Self::DrumLayer(layer - 1),
+            Self::DrumLayer(_) => Self::Drum,
+            Self::Drum => Self::Octave3,
+            Self::Octave3 => Self::Octave4,
+            Self::Octave4 => Self::Octave5,
+            Self::Octave5 if drum_expanded => Self::DrumLayer(11),
+            Self::Octave5 => Self::Drum,
+        }
+    }
+
+    /// Cycle to the previous row (Shift+Tab). When drum_expanded, includes drum layers.
+    pub fn prev(self, drum_expanded: bool) -> Self {
+        match self {
+            Self::DrumLayer(layer) if layer < 11 => Self::DrumLayer(layer + 1),
+            Self::DrumLayer(_) => Self::Octave5,
+            Self::Drum if drum_expanded => Self::DrumLayer(0),
+            Self::Drum => Self::Octave5,
+            Self::Octave3 => Self::Drum,
+            Self::Octave4 => Self::Octave3,
+            Self::Octave5 => Self::Octave4,
+        }
+    }
+
+    /// Returns the drum layer index if this is a DrumLayer row
+    pub fn drum_layer(self) -> Option<usize> {
+        match self {
+            Self::DrumLayer(layer) => Some(layer),
+            _ => None,
+        }
+    }
+}
+
+/// Note repeat rate for MPC/Maschine-style triggering
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RepeatRate {
+    #[default]
+    Off,
+    Quarter,         // 1/4 note
+    Eighth,          // 1/8 note
+    EighthTriplet,   // 1/8T
+    Sixteenth,       // 1/16 note
+    SixteenthTriplet, // 1/16T
+    ThirtySecond,    // 1/32 note
+}
+
+impl RepeatRate {
+    /// Returns repeat interval in beats, or None if Off
+    pub fn beats(self) -> Option<f64> {
+        match self {
+            Self::Off => None,
+            Self::Quarter => Some(1.0),
+            Self::Eighth => Some(0.5),
+            Self::EighthTriplet => Some(1.0 / 3.0),
+            Self::Sixteenth => Some(0.25),
+            Self::SixteenthTriplet => Some(1.0 / 6.0),
+            Self::ThirtySecond => Some(0.125),
+        }
+    }
+
+    /// Display name for UI
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Quarter => "1/4",
+            Self::Eighth => "1/8",
+            Self::EighthTriplet => "1/8T",
+            Self::Sixteenth => "1/16",
+            Self::SixteenthTriplet => "1/16T",
+            Self::ThirtySecond => "1/32",
+        }
+    }
+}
+
+/// All repeat rates for UI selector
+pub const ALL_REPEAT_RATES: [RepeatRate; 7] = [
+    RepeatRate::Off,
+    RepeatRate::Quarter,
+    RepeatRate::Eighth,
+    RepeatRate::EighthTriplet,
+    RepeatRate::Sixteenth,
+    RepeatRate::SixteenthTriplet,
+    RepeatRate::ThirtySecond,
+];

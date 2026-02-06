@@ -1,8 +1,12 @@
 //! Input handling for the keyboard sequencer panel.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use egui::{Key, Ui};
+use hallucinator_services::EngineState;
+
+use super::types::RepeatRate;
 
 use crate::clipboard::{ClipboardContent, DawClipboard};
 
@@ -10,22 +14,148 @@ use super::types::*;
 use super::KeyboardSequencerPanel;
 
 impl KeyboardSequencerPanel {
-    pub(super) fn handle_drum_input(&mut self, ui: &mut Ui) -> Vec<KeyboardSequencerAction> {
-        let mut actions = Vec::new();
-        let sc = self.step_count();
+    /// Handle Tab/Shift+Tab to cycle through sequencer rows
+    pub(super) fn handle_row_navigation(&mut self) {
+        // Tab is consumed at app level and stored in pending_tab
+        let Some(shift_held) = self.pending_tab.take() else {
+            return;
+        };
 
-        for (i, &key) in DRUM_KEYS[..sc].iter().enumerate() {
-            if !ui.input(|inp| inp.key_pressed(key)) { continue; }
-            self.drum_steps[i].active = !self.drum_steps[i].active;
-            actions.push(KeyboardSequencerAction::ToggleDrumStep(i));
-            // Preview sound when toggling ON a step that has any active sample
-            let mask = self.drum_steps[i].active_layer_mask();
-            if self.drum_steps[i].active && mask != 0 {
-                actions.push(KeyboardSequencerAction::PlayDrumStep { step: i, velocity: self.base_velocity, active_layers: mask });
+        self.active_row = if shift_held {
+            self.active_row.prev(self.drum_expanded)
+        } else {
+            self.active_row.next(self.drum_expanded)
+        };
+
+        // Sync active_drum_layer when navigating to a drum layer row
+        if let Some(layer) = self.active_row.drum_layer() {
+            self.active_drum_layer = layer;
+        }
+    }
+
+    /// Handle arrow key navigation when a step is selected
+    /// Arrows navigate the selected cell in any direction
+    pub(super) fn handle_arrow_navigation(&mut self, ui: &mut Ui) {
+        let Some(current_step) = self.selected_step else { return };
+
+        // Consume arrow keys to prevent other widgets from processing them
+        let left = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft));
+        let right = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowRight));
+        let up = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp));
+        let down = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown));
+
+        let max_step = self.drum_step_count.saturating_sub(1);
+
+        // Left/Right: navigate steps
+        self.selected_step = left.then(|| current_step.saturating_sub(1)).or(self.selected_step);
+        self.selected_step = right.then(|| (current_step + 1).min(max_step)).or(self.selected_step);
+
+        // Up/Down: navigate rows (move selected cell to different row)
+        let new_row = match (up, down) {
+            (true, _) => Some(self.active_row.prev(self.drum_expanded)),
+            (_, true) => Some(self.active_row.next(self.drum_expanded)),
+            _ => None,
+        };
+        if let Some(row) = new_row {
+            self.active_row = row;
+            self.active_drum_layer = row.drum_layer().unwrap_or(self.active_drum_layer);
+        }
+    }
+
+    pub(super) fn handle_drum_input(&mut self, ui: &mut Ui, engine_state: &Arc<EngineState>) -> Vec<KeyboardSequencerAction> {
+        let mut actions = Vec::new();
+        let has_ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+        let dsc = self.drum_step_count;
+
+        // Get current beat for note repeat timing
+        let current_beat = self.get_current_beat(engine_state);
+
+        // Determine active row for triggering
+        let active_row = match self.active_row {
+            SequencerRow::DrumLayer(layer) => Some(layer),
+            SequencerRow::Drum => Some(self.active_drum_layer),
+            _ => None,
+        };
+
+        for (i, &key) in DRUM_KEYS[..dsc].iter().enumerate() {
+            let is_down = ui.input(|inp| inp.key_down(key));
+            let was_down = (self.triggered_steps & (1 << i)) != 0;
+
+            // Key released - clear state
+            if !is_down && was_down {
+                self.triggered_steps &= !(1 << i);
+                self.last_repeat_beat.remove(&i);
+                continue;
+            }
+
+            // Key not pressed - skip
+            if !is_down {
+                continue;
+            }
+
+            // Not on a drum row - skip
+            let Some(row) = active_row else { continue };
+
+            // Key just pressed (new press)
+            if !was_down {
+                self.triggered_steps |= 1 << i;
+                self.last_repeat_beat.insert(i, current_beat);
+
+                // Ctrl + key: toggle step active for this row
+                if has_ctrl {
+                    self.drum_steps[i].layers[row].active = !self.drum_steps[i].layers[row].active;
+                    actions.push(KeyboardSequencerAction::ToggleDrumStep(i));
+                }
+
+                // Play row's sample (if row has a sample assigned)
+                if self.row_samples[row].is_some() {
+                    actions.push(KeyboardSequencerAction::PlayRowSample { row, velocity: self.base_velocity });
+                }
+                continue;
+            }
+
+            // Key held - check for note repeat
+            if self.repeat_rate == RepeatRate::Off {
+                continue;
+            }
+            let Some(interval) = self.repeat_rate.beats() else { continue };
+            let last = self.last_repeat_beat.get(&i).copied().unwrap_or(0.0);
+            if current_beat < last + interval {
+                continue;
+            }
+
+            // Fire repeat trigger
+            self.last_repeat_beat.insert(i, current_beat);
+            if self.row_samples[row].is_some() {
+                actions.push(KeyboardSequencerAction::PlayRowSample { row, velocity: self.base_velocity });
             }
         }
 
         actions
+    }
+
+    /// Toggle drum step/layer active state based on current row
+    fn handle_drum_toggle(&mut self, step: usize) {
+        match self.active_row {
+            SequencerRow::DrumLayer(layer) => {
+                self.drum_steps[step].layers[layer].active = !self.drum_steps[step].layers[layer].active;
+                self.drum_steps[step].active = self.drum_steps[step].active_layer_mask() != 0;
+            }
+            SequencerRow::Drum => {
+                self.drum_steps[step].active = !self.drum_steps[step].active;
+            }
+            _ => {}
+        }
+    }
+
+    /// Get current playback position in beats
+    fn get_current_beat(&self, engine_state: &Arc<EngineState>) -> f64 {
+        let position = engine_state.position.load(Ordering::Relaxed);
+        let Ok(timeline) = engine_state.timeline.lock() else { return 0.0 };
+        let sample_rate = timeline.transport.sample_rate as f64;
+        let bpm = timeline.transport.bpm;
+        if sample_rate == 0.0 { return 0.0; }
+        position as f64 / sample_rate * bpm / 60.0
     }
 
     pub(super) fn handle_drum_copy_paste(
@@ -37,42 +167,38 @@ impl KeyboardSequencerPanel {
         let modifiers = ui.input(|i| i.modifiers);
         let ctrl = modifiers.ctrl || modifiers.mac_cmd;
 
-        // Ctrl+C: copy selected step's active layer
-        if ctrl && ui.input(|i| i.key_pressed(Key::C)) {
-            tracing::debug!("Ctrl+C pressed, selected_step={:?}, active_layer={}", self.selected_step, self.active_drum_layer);
-            if let Some(sel) = self.selected_step.filter(|&s| s < self.drum_steps.len()) {
-                let has_sample = self.drum_steps[sel].layers[self.active_drum_layer].sample_name.is_some();
-                tracing::debug!("Copy check: step={} layer={} has_sample={}", sel, self.active_drum_layer, has_sample);
-                if has_sample {
-                    actions.push(KeyboardSequencerAction::CopyDrumStep { step: sel, layer: self.active_drum_layer });
-                }
-            }
+        // Get active row for row-level operations
+        let active_row = match self.active_row {
+            SequencerRow::DrumLayer(row) => Some(row),
+            _ => None,
+        };
+
+        // Ctrl+C: copy row sample
+        let c_pressed = ui.input(|i| {
+            i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::C, pressed: true, .. }))
+        });
+        let copy_row = active_row.filter(|&r| ctrl && c_pressed && self.row_samples[r].is_some());
+        if let Some(row) = copy_row {
+            actions.push(KeyboardSequencerAction::CopyRowSample { row });
         }
 
-        // Ctrl+V: paste from clipboard — check Event::Paste (platform Ctrl+V)
-        // and raw key as fallback
-        let paste = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))))
-            || (ctrl && ui.input(|i| i.key_pressed(Key::V)));
-        if paste {
-            tracing::debug!("Paste triggered, selected_step={:?}, clipboard_has_content={}", self.selected_step, clipboard.content().is_some());
-            if let Some(to) = self.selected_step.filter(|&s| s < self.drum_steps.len()) {
-                let paste_actions = self.paste_from_clipboard(clipboard, to, self.active_drum_layer);
-                tracing::debug!("Generated {} paste actions", paste_actions.len());
-                actions.extend(paste_actions);
-            }
+        // Ctrl+V: paste to row
+        let v_pressed = ui.input(|i| {
+            i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::V, pressed: true, .. }))
+        });
+        let paste_event = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
+        let paste = paste_event || (ctrl && v_pressed);
+        let paste_row = active_row.filter(|_| paste && clipboard.content().is_some());
+        if let Some(row) = paste_row {
+            actions.push(KeyboardSequencerAction::PasteRowSample { row });
         }
 
-        // Delete/Backspace: clear selected step's active layer sample
+        // Delete/Backspace: clear row sample
         let delete = ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace));
-        let step = self.selected_step.filter(|&s| s < self.drum_steps.len());
-        let layer = self.active_drum_layer;
-        let has_sample = step.map(|s| self.drum_steps[s].layers[layer].sample_name.is_some()).unwrap_or(false);
-
-        if delete && has_sample {
-            let step = step.unwrap();
-            self.drum_steps[step].layers[layer].sample_name = None;
-            self.drum_steps[step].layers[layer].active = false;
-            actions.push(KeyboardSequencerAction::ClearStepSample { step, layer });
+        let delete_row = active_row.filter(|&r| delete && self.row_samples[r].is_some());
+        if let Some(row) = delete_row {
+            self.row_samples[row] = None;
+            actions.push(KeyboardSequencerAction::ClearRowSample { row });
         }
 
         actions

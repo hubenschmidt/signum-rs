@@ -133,7 +133,7 @@ impl SampleKit {
         }
     }
 
-    /// Queue step trigger at specific sample offset for sample-accurate timing.
+    /// Queue step trigger at specific sample offset for sample-accurate timing (legacy step×layer model).
     pub fn queue_step_trigger(&mut self, step: usize, velocity: u8, active_layers: u16, sample_offset: u32) {
         let base = step * 12;
         for layer in 0..12u16 {
@@ -146,7 +146,18 @@ impl SampleKit {
         }
     }
 
-    fn trigger_slot(&mut self, slot: usize, velocity: u8) {
+    /// Queue row triggers at specific sample offset (new row-based model: slot = row).
+    pub fn queue_row_triggers(&mut self, active_rows: u16, velocity: u8, sample_offset: u32) {
+        for row in 0..12u16 {
+            if active_rows & (1 << row) == 0 { continue; }
+            let slot = row as usize;
+            if slot >= self.slots.len() || self.slots[slot].is_none() { continue; }
+            let pitch = BASE_NOTE + (slot as u8);
+            self.pending_events.push((pitch, velocity, sample_offset));
+        }
+    }
+
+    pub fn trigger_slot(&mut self, slot: usize, velocity: u8) {
         if slot >= self.slots.len() || self.slots[slot].is_none() {
             return;
         }

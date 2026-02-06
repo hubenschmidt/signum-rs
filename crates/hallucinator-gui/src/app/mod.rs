@@ -164,6 +164,21 @@ impl eframe::App for HallucinatorApp {
             }
         });
 
+        // Consume Tab globally to prevent egui's focus navigation from stealing it
+        // Check if shift is held, then consume Tab with any modifiers
+        let shift_held = ctx.input(|i| i.modifiers.shift);
+        let tab_pressed = ctx.input(|i| i.key_pressed(egui::Key::Tab));
+        if tab_pressed {
+            // Consume both variants to fully remove Tab from the event queue
+            ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+                i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
+            });
+            self.keyboard_sequencer_panel.pending_tab = Some(shift_held);
+        } else {
+            self.keyboard_sequencer_panel.pending_tab = None;
+        }
+
         // Global spacebar → toggle playback (skip if a text field is focused)
         let text_focused = ctx.memory(|mem| mem.focused().is_some())
             && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_))));
