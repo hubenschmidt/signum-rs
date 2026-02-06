@@ -174,9 +174,7 @@ impl eframe::App for HallucinatorApp {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
                 i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
             });
-            self.keyboard_sequencer_panel.pending_tab = Some(shift_held);
-        } else {
-            self.keyboard_sequencer_panel.pending_tab = None;
+            self.keyboard_sequencer_panel.set_pending_tab(shift_held);
         }
 
         // Global spacebar → toggle playback (skip if a text field is focused)

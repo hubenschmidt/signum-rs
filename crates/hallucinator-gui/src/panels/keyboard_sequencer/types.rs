@@ -1,5 +1,6 @@
 //! Types, constants, and color palette for the keyboard sequencer panel.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -129,9 +130,8 @@ impl DrumStep {
 
     /// Bitmask of which layers are active (bit N = layer N)
     pub fn active_layer_mask(&self) -> u16 {
-        self.layers.iter().enumerate().fold(0u16, |mask, (i, l)| {
-            if l.active { mask | (1 << i) } else { mask }
-        })
+        self.layers.iter().enumerate()
+            .fold(0u16, |mask, (i, l)| mask | ((l.active as u16) << i))
     }
 }
 
@@ -162,6 +162,46 @@ pub enum KeyboardSequencerAction {
     MoveRowSample { from_row: usize, to_row: usize },
     /// Toggle row enabled/muted state
     ToggleRowEnabled { row: usize },
+}
+
+/// UI interaction detected during grid drawing, processed separately for SoC
+#[derive(Clone, Debug)]
+pub(super) enum GridInteraction {
+    /// Click on a DR row step
+    DrumRowClick { step: usize },
+    /// Click on expanded grid sample button
+    SampleButtonClick { row: usize, ctrl: bool },
+    /// Click on expanded grid step cell
+    GridCellClick { step: usize, row: usize, ctrl: bool },
+    /// Click on a melodic row cell
+    MelodicCellClick { step: usize, row: SequencerRow },
+}
+
+/// Selection state for the sequencer grid (extracted from panel struct for SoC)
+#[derive(Clone, Debug)]
+pub(crate) struct SelectionState {
+    /// Currently selected step index
+    pub selected_step: Option<usize>,
+    /// Which row is active for keyboard input
+    pub active_row: SequencerRow,
+    /// Active drum layer (synced when navigating to drum layer rows)
+    pub active_drum_layer: usize,
+    /// Multi-selected rows (for batch operations)
+    pub selected_rows: HashSet<usize>,
+    /// Multi-selected cells (row, step) for batch operations
+    pub selected_cells: HashSet<(usize, usize)>,
+}
+
+impl Default for SelectionState {
+    fn default() -> Self {
+        Self {
+            selected_step: None,
+            active_row: SequencerRow::default(),
+            active_drum_layer: 0,
+            selected_rows: HashSet::new(),
+            selected_cells: HashSet::new(),
+        }
+    }
 }
 
 /// Payload for dragging a drum step within the sequencer (step, layer)

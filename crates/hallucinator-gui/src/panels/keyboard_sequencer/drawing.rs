@@ -6,8 +6,13 @@ use egui::{Color32, Key, Rect, Sense, Stroke, Ui, Vec2};
 
 use crate::clipboard::DawClipboard;
 
-use super::types::*;
 use super::KeyboardSequencerPanel;
+use super::types::{
+    DragRowSample, DragStep, GridInteraction, KeyboardSequencerAction, SequencerRow,
+    DRUM_KEY_LABELS, LABEL_BRIGHT, LABEL_DIM, PAD_ACTIVE, PAD_ACTIVE_STEP,
+    PAD_BG, PAD_BLACK, PAD_BORDER, PAD_CURRENT, PAD_PRESSED,
+    truncate_label,
+};
 
 impl KeyboardSequencerPanel {
     pub(super) fn draw_drum_row(
@@ -16,10 +21,11 @@ impl KeyboardSequencerPanel {
         is_playing: bool,
         clipboard: &DawClipboard,
         is_active_row: bool,
-    ) -> Vec<KeyboardSequencerAction> {
+    ) -> (Vec<KeyboardSequencerAction>, Vec<GridInteraction>) {
         let mut actions = Vec::new();
+        let mut interactions = Vec::new();
         let l = self.layout();
-        let layer = self.active_drum_layer;
+        let layer = self.sel.active_drum_layer;
         let sample_btn_w = l.label_w * 1.8;
 
         ui.horizontal(|ui| {
@@ -37,12 +43,13 @@ impl KeyboardSequencerPanel {
                 label_color,
             );
 
-            for i in 0..self.drum_steps.len() {
+            let step_count = self.drum_steps.len();
+            for i in 0..step_count {
                 let active = self.drum_steps[i].active;
                 let has_sample = self.drum_steps[i].layers[layer].sample_name.is_some();
                 let is_current = is_playing && self.current_step == i;
                 let is_triggered = (self.triggered_steps & (1 << i)) != 0;
-                let is_selected = is_active_row && self.selected_step == Some(i);
+                let is_selected = is_active_row && self.sel.selected_step == Some(i);
                 let (response, painter) = ui.allocate_painter(Vec2::splat(l.size), Sense::click_and_drag());
                 let rect = response.rect;
 
@@ -70,12 +77,9 @@ impl KeyboardSequencerPanel {
                     });
                 }
 
-                // --- Click: select step, toggle active ---
+                // --- Click: emit interaction for processing in input.rs ---
                 if response.clicked() && !any_drop_hover {
-                    self.selected_step = Some(i);
-                    self.active_row = SequencerRow::Drum;
-                    self.drum_steps[i].active = !active;
-                    actions.push(KeyboardSequencerAction::ToggleDrumStep(i));
+                    interactions.push(GridInteraction::DrumRowClick { step: i });
                 }
 
                 // --- Drag: initiate step drag if step has a sample ---
@@ -128,7 +132,7 @@ impl KeyboardSequencerPanel {
             }
         });
 
-        actions
+        (actions, interactions)
     }
 
     pub(super) fn draw_expanded_grid(
@@ -136,14 +140,16 @@ impl KeyboardSequencerPanel {
         ui: &mut Ui,
         is_playing: bool,
         _clipboard: &DawClipboard,
-    ) -> Vec<KeyboardSequencerAction> {
+    ) -> (Vec<KeyboardSequencerAction>, Vec<GridInteraction>) {
         let mut actions = Vec::new();
+        let mut interactions = Vec::new();
         let l = self.layout();
         let step_count = self.drum_steps.len();
         let cell_size = l.size * 0.8;
         let sample_btn_w = l.label_w * 1.8;
 
-        let active_row = self.active_row;
+        let active_row = self.sel.active_row;
+        let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
 
         // Draw layers bottom-to-top (layer 0 at bottom, layer 11 at top)
         for row in (0..12).rev() {
@@ -187,36 +193,11 @@ impl KeyboardSequencerPanel {
                 }
 
                 let row_enabled = self.row_enabled[row];
-                let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
-                let row_is_selected = self.selected_rows.contains(&row);
+                let row_is_selected = self.sel.selected_rows.contains(&row);
 
-                // Click handling: Ctrl+Click = multi-select, regular click = toggle mute
+                // Click: emit interaction for processing in input.rs
                 if sample_resp.clicked() {
-                    self.active_drum_layer = row;
-                    self.active_row = SequencerRow::DrumLayer(row);
-
-                    if ctrl_held {
-                        // Ctrl+Click: toggle selection (don't mute)
-                        if row_is_selected {
-                            self.selected_rows.remove(&row);
-                        } else {
-                            self.selected_rows.insert(row);
-                        }
-                    } else if row_has_sample {
-                        // Regular click on sample: toggle mute for this row and all selected
-                        let new_enabled = !row_enabled;
-                        self.row_enabled[row] = new_enabled;
-                        actions.push(KeyboardSequencerAction::ToggleRowEnabled { row });
-
-                        // Also toggle all selected rows to match
-                        for &sel_row in &self.selected_rows.clone() {
-                            if sel_row != row && self.row_samples[sel_row].is_some() {
-                                self.row_enabled[sel_row] = new_enabled;
-                                actions.push(KeyboardSequencerAction::ToggleRowEnabled { row: sel_row });
-                            }
-                        }
-                        self.selected_rows.clear();
-                    }
+                    interactions.push(GridInteraction::SampleButtonClick { row, ctrl: ctrl_held });
                 }
 
                 // Right-click context menu
@@ -224,16 +205,7 @@ impl KeyboardSequencerPanel {
                     if row_has_sample {
                         let mute_label = if row_enabled { "Mute" } else { "Unmute" };
                         if ui.button(mute_label).clicked() {
-                            let new_enabled = !row_enabled;
-                            self.row_enabled[row] = new_enabled;
-                            actions.push(KeyboardSequencerAction::ToggleRowEnabled { row });
-                            // Also apply to selected rows
-                            for &sel_row in &self.selected_rows.clone() {
-                                if sel_row != row && self.row_samples[sel_row].is_some() {
-                                    self.row_enabled[sel_row] = new_enabled;
-                                    actions.push(KeyboardSequencerAction::ToggleRowEnabled { row: sel_row });
-                                }
-                            }
+                            actions.extend(self.toggle_row_mute_batch(row));
                             ui.close_menu();
                         }
                     }
@@ -276,9 +248,8 @@ impl KeyboardSequencerPanel {
                     sample_painter.rect_stroke(sample_rect, l.radius * 0.5, Stroke::new(1.5, highlight_color), egui::StrokeKind::Outside);
                 }
 
-                let sample_label = self.row_samples[row].as_ref()
-                    .map(|n| truncate_label(n, 6))
-                    .unwrap_or_else(|| "---".to_string());
+                let sample_label = self.row_samples[row].as_deref()
+                    .map_or_else(|| "---".to_string(), |n| truncate_label(n, 6));
                 // Muted rows show dimmed text
                 let sample_text_color = match (row_has_sample, row_enabled) {
                     (true, true) => LABEL_BRIGHT,
@@ -309,7 +280,7 @@ impl KeyboardSequencerPanel {
                     let is_current = is_playing && self.current_step == step;
                     let is_triggered = is_active_row && (self.triggered_steps & (1 << step)) != 0;
                     let cell_key = (row, step);
-                    let cell_is_multi_selected = self.selected_cells.contains(&cell_key);
+                    let cell_is_multi_selected = self.sel.selected_cells.contains(&cell_key);
 
                     let (response, painter) = ui.allocate_painter(
                         Vec2::new(l.size, cell_size),
@@ -317,36 +288,9 @@ impl KeyboardSequencerPanel {
                     );
                     let rect = response.rect;
 
-                    let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
-
-                    // Click: Ctrl+Click = multi-select, regular click = toggle active
+                    // Click: emit interaction for processing in input.rs
                     if response.clicked() {
-                        self.selected_step = Some(step);
-                        self.active_drum_layer = row;
-                        self.active_row = SequencerRow::DrumLayer(row);
-
-                        if ctrl_held {
-                            // Ctrl+Click: toggle cell selection (don't toggle active)
-                            if cell_is_multi_selected {
-                                self.selected_cells.remove(&cell_key);
-                            } else {
-                                self.selected_cells.insert(cell_key);
-                            }
-                        } else {
-                            // Regular click: toggle this cell and all selected cells
-                            let new_active = !step_active;
-                            self.drum_steps[step].layers[row].active = new_active;
-                            actions.push(KeyboardSequencerAction::ToggleDrumStep(step));
-
-                            // Also toggle all multi-selected cells to match
-                            for &(sel_row, sel_step) in &self.selected_cells.clone() {
-                                if (sel_row, sel_step) != cell_key {
-                                    self.drum_steps[sel_step].layers[sel_row].active = new_active;
-                                    actions.push(KeyboardSequencerAction::ToggleDrumStep(sel_step));
-                                }
-                            }
-                            self.selected_cells.clear();
-                        }
+                        interactions.push(GridInteraction::GridCellClick { step, row, ctrl: ctrl_held });
                     }
 
                     // Visual
@@ -367,7 +311,7 @@ impl KeyboardSequencerPanel {
                     painter.rect_stroke(rect, l.radius * 0.5, Stroke::new(0.5, PAD_BORDER), egui::StrokeKind::Outside);
 
                     // Selection highlight (single selection or multi-selected)
-                    let is_selected = is_active_row && self.selected_step == Some(step);
+                    let is_selected = is_active_row && self.sel.selected_step == Some(step);
                     if is_selected || cell_is_multi_selected {
                         let highlight_color = if cell_is_multi_selected {
                             Color32::from_rgb(100, 140, 180)
@@ -402,10 +346,11 @@ impl KeyboardSequencerPanel {
             ui.add_space(1.0);
         }
 
-        actions
+        (actions, interactions)
     }
 
-    pub(super) fn draw_melodic_row(&mut self, ui: &mut Ui, label: &str, keys: &[Key], _base_pitch: u8, is_playing: bool, is_active_row: bool, row: SequencerRow) {
+    pub(super) fn draw_melodic_row(&mut self, ui: &mut Ui, label: &str, keys: &[Key], _base_pitch: u8, is_playing: bool, is_active_row: bool, row: SequencerRow) -> Vec<GridInteraction> {
+        let mut interactions = Vec::new();
         let l = self.layout();
         let sample_btn_w = l.label_w * 1.8;
         ui.horizontal(|ui| {
@@ -427,15 +372,14 @@ impl KeyboardSequencerPanel {
                 let is_pressed = self.pressed_keys.contains_key(&key);
                 let is_black = self.is_step_accidental(i);
                 let is_current = is_playing && self.current_step == i;
-                let is_selected = is_active_row && self.selected_step == Some(i);
+                let is_selected = is_active_row && self.sel.selected_step == Some(i);
 
                 let (response, painter) = ui.allocate_painter(Vec2::splat(l.size), Sense::click());
                 let rect = response.rect;
 
-                // Click to select this cell
+                // Click: emit interaction for processing in input.rs
                 if response.clicked() {
-                    self.selected_step = Some(i);
-                    self.active_row = row;
+                    interactions.push(GridInteraction::MelodicCellClick { step: i, row });
                 }
 
                 let bg = if is_pressed {
@@ -475,6 +419,7 @@ impl KeyboardSequencerPanel {
                 ui.add_space(l.spacing);
             }
         });
+        interactions
     }
 
     /// Draw a single Factory Rat-style pad

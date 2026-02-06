@@ -6,12 +6,13 @@ use std::sync::atomic::Ordering;
 use egui::{Key, Ui};
 use hallucinator_services::EngineState;
 
-use super::types::RepeatRate;
-
 use crate::clipboard::{ClipboardContent, DawClipboard};
 
-use super::types::*;
 use super::KeyboardSequencerPanel;
+use super::types::{
+    GridInteraction, KeyboardSequencerAction, RepeatRate, SequencerRow,
+    DRUM_KEYS, OCTAVE_3_KEYS, OCTAVE_4_KEYS, OCTAVE_5_KEYS,
+};
 
 impl KeyboardSequencerPanel {
     /// Handle Tab/Shift+Tab to cycle through sequencer rows
@@ -21,22 +22,22 @@ impl KeyboardSequencerPanel {
             return;
         };
 
-        self.active_row = if shift_held {
-            self.active_row.prev(self.drum_expanded)
+        self.sel.active_row = if shift_held {
+            self.sel.active_row.prev(self.drum_expanded)
         } else {
-            self.active_row.next(self.drum_expanded)
+            self.sel.active_row.next(self.drum_expanded)
         };
 
         // Sync active_drum_layer when navigating to a drum layer row
-        if let Some(layer) = self.active_row.drum_layer() {
-            self.active_drum_layer = layer;
+        if let Some(layer) = self.sel.active_row.drum_layer() {
+            self.sel.active_drum_layer = layer;
         }
     }
 
     /// Handle arrow key navigation when a step is selected
     /// Arrows navigate the selected cell in any direction
     pub(super) fn handle_arrow_navigation(&mut self, ui: &mut Ui) {
-        let Some(current_step) = self.selected_step else { return };
+        let Some(current_step) = self.sel.selected_step else { return };
 
         // Consume arrow keys to prevent other widgets from processing them
         let left = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft));
@@ -47,18 +48,18 @@ impl KeyboardSequencerPanel {
         let max_step = self.drum_step_count.saturating_sub(1);
 
         // Left/Right: navigate steps
-        self.selected_step = left.then(|| current_step.saturating_sub(1)).or(self.selected_step);
-        self.selected_step = right.then(|| (current_step + 1).min(max_step)).or(self.selected_step);
+        self.sel.selected_step = left.then(|| current_step.saturating_sub(1)).or(self.sel.selected_step);
+        self.sel.selected_step = right.then(|| (current_step + 1).min(max_step)).or(self.sel.selected_step);
 
         // Up/Down: navigate rows (move selected cell to different row)
         let new_row = match (up, down) {
-            (true, _) => Some(self.active_row.prev(self.drum_expanded)),
-            (_, true) => Some(self.active_row.next(self.drum_expanded)),
+            (true, _) => Some(self.sel.active_row.prev(self.drum_expanded)),
+            (_, true) => Some(self.sel.active_row.next(self.drum_expanded)),
             _ => None,
         };
         if let Some(row) = new_row {
-            self.active_row = row;
-            self.active_drum_layer = row.drum_layer().unwrap_or(self.active_drum_layer);
+            self.sel.active_row = row;
+            self.sel.active_drum_layer = row.drum_layer().unwrap_or(self.sel.active_drum_layer);
         }
     }
 
@@ -71,9 +72,9 @@ impl KeyboardSequencerPanel {
         let current_beat = self.get_current_beat(engine_state);
 
         // Determine active row for triggering
-        let active_row = match self.active_row {
+        let active_row = match self.sel.active_row {
             SequencerRow::DrumLayer(layer) => Some(layer),
-            SequencerRow::Drum => Some(self.active_drum_layer),
+            SequencerRow::Drum => Some(self.sel.active_drum_layer),
             _ => None,
         };
 
@@ -81,50 +82,35 @@ impl KeyboardSequencerPanel {
             let is_down = ui.input(|inp| inp.key_down(key));
             let was_down = (self.triggered_steps & (1 << i)) != 0;
 
-            // Key released - clear state
+            // Guard: key released — clear state
             if !is_down && was_down {
                 self.triggered_steps &= !(1 << i);
                 self.last_repeat_beat.remove(&i);
-                continue;
             }
 
-            // Key not pressed - skip
-            if !is_down {
-                continue;
-            }
+            // Guard: key not pressed or not on a drum row
+            let Some(row) = active_row.filter(|_| is_down) else { continue };
 
-            // Not on a drum row - skip
-            let Some(row) = active_row else { continue };
-
-            // Key just pressed (new press)
+            // New press: trigger sample and optionally toggle step
             if !was_down {
                 self.triggered_steps |= 1 << i;
                 self.last_repeat_beat.insert(i, current_beat);
 
-                // Ctrl + key: toggle step active for this row
                 if has_ctrl {
                     self.drum_steps[i].layers[row].active = !self.drum_steps[i].layers[row].active;
                     actions.push(KeyboardSequencerAction::ToggleDrumStep(i));
                 }
-
-                // Play row's sample (if row has a sample assigned)
                 if self.row_samples[row].is_some() {
                     actions.push(KeyboardSequencerAction::PlayRowSample { row, velocity: self.base_velocity });
                 }
                 continue;
             }
 
-            // Key held - check for note repeat
-            if self.repeat_rate == RepeatRate::Off {
-                continue;
-            }
+            // Held: note repeat (guard: repeat off or interval not elapsed)
             let Some(interval) = self.repeat_rate.beats() else { continue };
             let last = self.last_repeat_beat.get(&i).copied().unwrap_or(0.0);
-            if current_beat < last + interval {
-                continue;
-            }
+            if current_beat < last + interval { continue; }
 
-            // Fire repeat trigger
             self.last_repeat_beat.insert(i, current_beat);
             if self.row_samples[row].is_some() {
                 actions.push(KeyboardSequencerAction::PlayRowSample { row, velocity: self.base_velocity });
@@ -136,15 +122,13 @@ impl KeyboardSequencerPanel {
 
     /// Toggle drum step/layer active state based on current row
     fn handle_drum_toggle(&mut self, step: usize) {
-        match self.active_row {
-            SequencerRow::DrumLayer(layer) => {
-                self.drum_steps[step].layers[layer].active = !self.drum_steps[step].layers[layer].active;
-                self.drum_steps[step].active = self.drum_steps[step].active_layer_mask() != 0;
-            }
-            SequencerRow::Drum => {
-                self.drum_steps[step].active = !self.drum_steps[step].active;
-            }
-            _ => {}
+        if let SequencerRow::DrumLayer(layer) = self.sel.active_row {
+            self.drum_steps[step].layers[layer].active = !self.drum_steps[step].layers[layer].active;
+            self.drum_steps[step].active = self.drum_steps[step].active_layer_mask() != 0;
+            return;
+        }
+        if self.sel.active_row == SequencerRow::Drum {
+            self.drum_steps[step].active = !self.drum_steps[step].active;
         }
     }
 
@@ -168,7 +152,7 @@ impl KeyboardSequencerPanel {
         let ctrl = modifiers.ctrl || modifiers.mac_cmd;
 
         // Get active row for row-level operations
-        let active_row = match self.active_row {
+        let active_row = match self.sel.active_row {
             SequencerRow::DrumLayer(row) => Some(row),
             _ => None,
         };
@@ -224,6 +208,88 @@ impl KeyboardSequencerPanel {
                 }]
             }
         }
+    }
+
+    /// Process grid interactions detected during drawing (SoC: mutations live here, not in drawing)
+    pub(super) fn handle_grid_interactions(&mut self, interactions: Vec<GridInteraction>) -> Vec<KeyboardSequencerAction> {
+        let mut actions = Vec::new();
+        for interaction in interactions {
+            match interaction {
+                GridInteraction::DrumRowClick { step } => {
+                    self.sel.selected_step = Some(step);
+                    self.sel.active_row = SequencerRow::Drum;
+                    self.drum_steps[step].active = !self.drum_steps[step].active;
+                    actions.push(KeyboardSequencerAction::ToggleDrumStep(step));
+                }
+                GridInteraction::SampleButtonClick { row, ctrl } => {
+                    self.sel.active_drum_layer = row;
+                    self.sel.active_row = SequencerRow::DrumLayer(row);
+                    if ctrl {
+                        if !self.sel.selected_rows.remove(&row) {
+                            self.sel.selected_rows.insert(row);
+                        }
+                    } else {
+                        actions.extend(self.toggle_row_mute_batch(row));
+                    }
+                }
+                GridInteraction::GridCellClick { step, row, ctrl } => {
+                    self.sel.selected_step = Some(step);
+                    self.sel.active_drum_layer = row;
+                    self.sel.active_row = SequencerRow::DrumLayer(row);
+                    if ctrl {
+                        let cell_key = (row, step);
+                        if !self.sel.selected_cells.remove(&cell_key) {
+                            self.sel.selected_cells.insert(cell_key);
+                        }
+                    } else {
+                        actions.extend(self.toggle_grid_cell_batch(step, row));
+                    }
+                }
+                GridInteraction::MelodicCellClick { step, row } => {
+                    self.sel.selected_step = Some(step);
+                    self.sel.active_row = row;
+                }
+            }
+        }
+        actions
+    }
+
+    /// Toggle mute for a row and propagate to all selected rows
+    pub(super) fn toggle_row_mute_batch(&mut self, row: usize) -> Vec<KeyboardSequencerAction> {
+        if self.row_samples[row].is_none() { return Vec::new(); }
+
+        let mut actions = Vec::new();
+        let new_enabled = !self.row_enabled[row];
+        self.row_enabled[row] = new_enabled;
+        actions.push(KeyboardSequencerAction::ToggleRowEnabled { row });
+
+        let sel_rows: Vec<_> = self.sel.selected_rows.iter().copied()
+            .filter(|&r| r != row && self.row_samples[r].is_some())
+            .collect();
+        for sel_row in sel_rows {
+            self.row_enabled[sel_row] = new_enabled;
+            actions.push(KeyboardSequencerAction::ToggleRowEnabled { row: sel_row });
+        }
+        self.sel.selected_rows.clear();
+        actions
+    }
+
+    /// Toggle a grid cell's active state and propagate to all selected cells
+    pub(super) fn toggle_grid_cell_batch(&mut self, step: usize, row: usize) -> Vec<KeyboardSequencerAction> {
+        let mut actions = Vec::new();
+        let new_active = !self.drum_steps[step].layers[row].active;
+        self.drum_steps[step].layers[row].active = new_active;
+        actions.push(KeyboardSequencerAction::ToggleDrumStep(step));
+
+        let sel_cells: Vec<_> = self.sel.selected_cells.iter().copied()
+            .filter(|&c| c != (row, step))
+            .collect();
+        for (sel_row, sel_step) in sel_cells {
+            self.drum_steps[sel_step].layers[sel_row].active = new_active;
+            actions.push(KeyboardSequencerAction::ToggleDrumStep(sel_step));
+        }
+        self.sel.selected_cells.clear();
+        actions
     }
 
     pub(super) fn handle_melodic_input(&mut self, ui: &mut Ui) -> Vec<KeyboardSequencerAction> {
